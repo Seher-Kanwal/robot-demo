@@ -1,0 +1,31 @@
+import os
+
+
+def top_dir():
+    """
+    returns project top most directory
+    :return: (str) Project directory
+    """
+    return os.sep.join(
+        os.path.dirname(
+            os.path.realpath(__file__)).split(
+            os.sep)[
+                :-1])
+
+
+def data_dir():
+    """
+    Returns data directory. Data directory should never be in src, especially when using IDEs.
+    :return:(str) data directory
+    """
+    return top_dir() + '/data/configs'
+
+
+def configs_dir():
+    """
+    Returns configs directory
+    :return: (str) Configs directory
+    """
+    from termcolor import colored
+    print(colored(f"config dir is {os.sep.join([top_dir(), 'configs'])}", "red"))
+    return os.sep.join([top_dir(), 'configs'])
