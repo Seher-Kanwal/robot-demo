@@ -35,6 +35,7 @@
     --ood: #ff5a5f;
     --vlm: #f5a623;
     --memory: #b478e0;
+    --qwen: #3ecf8e;
     --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
     --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
@@ -56,6 +57,7 @@
     --ood: #d6333c;
     --vlm: #c97a06;
     --memory: #7c3fa8;
+    --qwen: #178a55;
   }
 
   @media (prefers-color-scheme: light) {
@@ -75,6 +77,7 @@
       --ood: #d6333c;
       --vlm: #c97a06;
       --memory: #7c3fa8;
+      --qwen: #178a55;
     }
   }
 
@@ -640,9 +643,122 @@
     .stat-grid { grid-template-columns: 1fr; }
     .card { padding: 14px 16px; }
   }
+
+  /* Camera-only view (the default; ?full=1 shows the whole demo page): nothing but the
+     live labeled camera frame, as large as the window allows. */
+  body.camera-only { padding: 12px; }
+  body.camera-only .page { max-width: none; gap: 0; }
+  body.camera-only .page > :not(#liveConsole) { display: none !important; }
+  body.camera-only #liveConsole { display: block !important; }
+  body.camera-only #liveConsole .side,
+  body.camera-only #liveConsole .statusbar,
+  body.camera-only #liveConsole .frame-caption,
+  body.camera-only #liveConsole .frame-col:first-child { display: none; }
+  body.camera-only #liveConsole .frame-dual { display: block; background: #000; }
+  body.camera-only #liveConsole .frame img {
+    width: auto; max-width: 100%;
+    height: calc(100vh - 24px - 42px); object-fit: contain;
+    margin: 0 auto;
+  }
+  body.camera-only #liveConsole .frame-placeholder { height: calc(100vh - 24px - 42px); aspect-ratio: auto; }
+
+  /* --- Qwen3-VL direct baseline (whole image -> VLM boxes + labels, no detector) ----- */
+  .stat dd.qwen { color: var(--qwen); }
+  .perf-badge {
+    position: absolute;
+    top: 10px;
+    left: 38px;
+    z-index: 1;
+    line-height: 1.4;
+    padding: 4px 9px;
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    color: #e8ecf1;
+    background: rgba(10, 13, 17, 0.74);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    pointer-events: none;
+  }
+  .perf-badge:empty { display: none; }
+  .perf-badge b { color: #f5a623; font-weight: 600; }
+  .perf-badge.qwen b { color: #3ecf8e; }
+  .titlebar button.compare-toggle {
+    height: 26px;
+    padding: 3px 10px;
+    font-size: 11px;
+  }
+  .titlebar button.compare-toggle[aria-pressed="true"] { color: var(--qwen); border-color: var(--qwen); }
+  .raw-output summary {
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .raw-output pre {
+    margin: 10px 0 0;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-dim);
+  }
+
+  /* Live comparison (the titlebar's "Compare with Qwen3-VL direct" toggle): the energy-split
+     column steps aside so the pipeline's final view and the Qwen-direct baseline sit side by
+     side, each with its own ms/frame + fps badge. */
+  .qwen-col, .cap-compare, .qwen-only, #liveQwenPerfCard { display: none; }
+  #liveConsole.qwen-on .qwen-col { display: flex; }
+  #liveConsole.qwen-on .ood-col, #liveConsole.qwen-on .cap-default { display: none; }
+  #liveConsole.qwen-on .cap-compare { display: inline; }
+  #liveConsole.qwen-on .qwen-only { display: flex; }
+  #liveConsole.qwen-on #liveQwenPerfCard { display: block; }
+  #liveConsole:not(.qwen-on) .perf-badge { display: none; }
+  body.camera-only #liveConsole.qwen-on .frame-dual {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+  }
+  body.camera-only #liveConsole.qwen-on .frame-caption { display: block; font-size: 11px; }
+  body.camera-only #liveConsole.qwen-on .frame img {
+    width: 100%;
+    height: auto;
+    max-height: calc(100vh - 24px - 42px - 24px);
+  }
+  body.camera-only #liveConsole.qwen-on .frame-placeholder { height: auto; aspect-ratio: 16 / 9; }
+  /* "Comparison results" under the frames while the comparison runs: per-method averages of
+     everything measured since the last Reset (/api/compare/metrics), plus the CSV for the report. */
+  .cmp-results { display: none; padding: 10px 14px 12px; border-top: 1px solid var(--border-soft); background: var(--panel); }
+  #liveConsole.qwen-on .cmp-results { display: block; }
+  .cmp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
+  .cmp-head h3 { margin: 0; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .13em;
+    text-transform: uppercase; color: var(--text-faint); }
+  .cmp-head .cmp-count { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+  .cmp-head .spacer { flex: 1; }
+  .cmp-head button, .cmp-head a { font-family: var(--mono); font-size: 11px; padding: 3px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: transparent; color: var(--text-dim); text-decoration: none; cursor: pointer; }
+  .cmp-head button:hover, .cmp-head a:hover { color: var(--text); border-color: var(--text-dim); }
+  .cmp-results table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; table-layout: fixed; }
+  .cmp-results th, .cmp-results td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  .cmp-results th { font-family: var(--mono); font-size: 10.5px; font-weight: 600; color: var(--text-faint); letter-spacing: .06em; }
+  .cmp-results th:first-child, .cmp-results td:first-child { width: 22%; color: var(--text-dim); }
+  .cmp-results .pipe { color: var(--accent); }
+  .cmp-results .qwen { color: var(--qwen); }
+  .cmp-results td.lbl { font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }
+  .cmp-results .cmp-note { margin: 6px 0 0; font-size: 11.5px; color: var(--text-faint); }
+  body.camera-only #liveConsole.qwen-on .frame img { max-height: calc(100vh - 24px - 42px - 24px - 230px); }
 </style>
 </head>
 <body>
+<script>
+  if (new URLSearchParams(location.search).get('full') !== '1') document.body.classList.add('camera-only');
+</script>
 
 <div class="page">
   <header class="top">
@@ -653,7 +769,8 @@
     <div class="top-meta">
       source: <b id="metaSource">—</b><br>
       detector: <b>Faster R-CNN · Pascal VOC · energy OOD</b><br>
-      labeler: <b>Qwen3-VL-4B-Instruct</b> → <b>Qwen3-VL-8B</b> → <b>you</b>
+      labeler: <b>Qwen3-VL-4B-Instruct</b> → <b>Qwen3-VL-8B</b> → <b>you</b><br>
+      <a href="/assistant" style="color:var(--accent)">robot assistant (&ldquo;where are my &hellip;?&rdquo;) →</a>
     </div>
   </header>
 
@@ -684,6 +801,7 @@
       </div>
     </div>
     <button id="runBtn" type="button">Run detection</button>
+    <button id="qwenRunBtn" type="button" class="secondary" title="Same image, straight to Qwen3-VL: it has to find and name every object itself, no detector">Run Qwen direct</button>
     <span class="ctrl-status" id="ctrlStatus"></span>
   </div>
 
@@ -843,6 +961,70 @@
     </div>
   </div>
 
+  <div class="console" id="qwenConsole" style="display:none;">
+    <div class="monitor">
+      <div class="titlebar">
+        <div class="dots"><span></span><span></span><span></span></div>
+        <span class="win-name">qwen3-vl direct · whole image → boxes + labels</span>
+        <span class="spacer"></span>
+        <span class="rec" id="qwenStatusPill" data-mode="ready"><span class="pulse"></span><span id="qwenStatusText">READY</span></span>
+      </div>
+      <div class="frame-caption">Qwen3-VL direct — no detector, no OOD split</div>
+      <div class="frame">
+        <img id="qwenFrameImg" alt="Qwen3-VL direct annotated frame" style="display:none;">
+        <div class="frame-placeholder" id="qwenFramePlaceholder">hit &ldquo;Run Qwen direct&rdquo; above</div>
+        <div class="bracket tl"></div>
+        <div class="bracket tr"></div>
+        <div class="bracket bl"></div>
+        <div class="bracket br"></div>
+      </div>
+      <div class="statusbar">
+        <span id="qwenStatusRes">–</span>
+        <span id="qwenStatusDet"><b>0</b> objects</span>
+        <span>model: <b id="qwenStatusModel">–</b></span>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="card">
+        <h2>Pipeline vs Qwen direct</h2>
+        <dl class="stat-grid">
+          <div class="stat">
+            <dt>Pipeline total</dt>
+            <dd id="cmpPipeMs">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Qwen direct</dt>
+            <dd id="cmpQwenMs" class="qwen">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Pipeline detections</dt>
+            <dd id="cmpPipeCount">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Qwen direct objects</dt>
+            <dd id="cmpQwenCount" class="qwen">–</dd>
+          </div>
+        </dl>
+        <p class="qa-hint" id="cmpNote"></p>
+      </div>
+
+      <div class="card">
+        <h2>Labels found (Qwen direct)</h2>
+        <div class="labels-found" id="qwenLabelsPills">
+          <span class="tag">none yet</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <details class="raw-output">
+          <summary>Raw model output</summary>
+          <pre id="qwenRawText"></pre>
+        </details>
+      </div>
+    </div>
+  </div>
+
   <div class="controls" id="liveControls" style="display:none;">
     <span class="ctrl-status" id="liveTopicLabel"></span>
     <button id="liveToggleBtn" type="button" class="secondary">Start live view</button>
@@ -857,12 +1039,14 @@
     <div class="monitor">
       <div class="titlebar">
         <div class="dots"><span></span><span></span><span></span></div>
-        <span class="win-name">robot_ood_detection · live (ROS)</span>
+        <span class="win-name" id="liveWinName">robot_ood_detection · live (ROS)</span>
         <span class="spacer"></span>
+        <button type="button" class="secondary compare-toggle" id="liveQwenToggleBtn" aria-pressed="false" style="display:none;"
+          title="Run Qwen3-VL on the whole live frame, no detector, side by side with this pipeline">Compare with Qwen3-VL direct</button>
         <span class="rec" id="liveStatusPill" data-mode="ready"><span class="pulse"></span><span id="liveStatusText">READY</span></span>
       </div>
       <div class="frame-dual">
-        <div class="frame-col">
+        <div class="frame-col ood-col">
           <div class="frame-caption">OOD detection (energy split)</div>
           <div class="frame">
             <img id="liveFrameImgOod" alt="live OOD-only annotated frame" style="display:none;">
@@ -874,10 +1058,23 @@
           </div>
         </div>
         <div class="frame-col">
-          <div class="frame-caption">VLM labeling</div>
+          <div class="frame-caption"><span class="cap-default">VLM labeling</span><span class="cap-compare">Our pipeline — detector + energy OOD + VLM</span></div>
           <div class="frame">
             <img id="liveFrameImg" alt="live annotated frame" style="display:none;">
             <div class="frame-placeholder" id="liveFramePlaceholder">waiting for the first frame&hellip;</div>
+            <div class="perf-badge" id="livePerfBadge"></div>
+            <div class="bracket tl"></div>
+            <div class="bracket tr"></div>
+            <div class="bracket bl"></div>
+            <div class="bracket br"></div>
+          </div>
+        </div>
+        <div class="frame-col qwen-col">
+          <div class="frame-caption">Qwen3-VL direct — whole image, no detector</div>
+          <div class="frame">
+            <img id="liveQwenImg" alt="live Qwen3-VL direct annotated frame" style="display:none;">
+            <div class="frame-placeholder" id="liveQwenPlaceholder">Qwen is reading the frame&hellip; each pass takes several seconds</div>
+            <div class="perf-badge qwen" id="liveQwenPerfBadge"></div>
             <div class="bracket tl"></div>
             <div class="bracket tr"></div>
             <div class="bracket bl"></div>
@@ -890,9 +1087,59 @@
         <span id="liveStatusDet"><b>0</b> detections</span>
         <span>energy&lt;<b id="liveStatusEnergy">-6.84</b> → unknown</span>
       </div>
+      <div class="cmp-results" id="cmpResults">
+        <div class="cmp-head">
+          <h3>Comparison results</h3>
+          <span class="cmp-count" id="cmpCount"></span>
+          <span class="spacer"></span>
+          <button type="button" id="cmpReset" title="Start a new measurement">Reset</button>
+          <a id="cmpCsv" href="/api/compare/metrics.csv" download>Download CSV</a>
+        </div>
+        <table>
+          <thead><tr><th></th><th class="pipe">OOD + VLM (our pipeline)</th><th class="qwen">VLM only (Qwen3-VL direct)</th></tr></thead>
+          <tbody id="cmpBody"><tr><td colspan="3" class="lbl">measuring&hellip;</td></tr></tbody>
+        </table>
+        <p class="cmp-note">Averages since the last Reset, live camera. fps = 1000 / mean ms, i.e. each method's own speed;
+          while compared the two take turns on the GPU. The CSV has every frame (also sample-image runs).</p>
+      </div>
     </div>
 
     <div class="side">
+      <div class="card" id="liveQwenPerfCard">
+        <h2>Live performance</h2>
+        <dl class="stat-grid">
+          <div class="stat">
+            <dt>Pipeline ms/frame</dt>
+            <dd id="livePerfPipeMs">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Qwen direct ms/frame</dt>
+            <dd id="livePerfQwenMs" class="qwen">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Pipeline fps</dt>
+            <dd id="livePerfPipeFps">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Qwen direct fps</dt>
+            <dd id="livePerfQwenFps" class="qwen">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Pipeline objects</dt>
+            <dd id="livePerfPipeCount">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Qwen direct objects</dt>
+            <dd id="livePerfQwenCount" class="qwen">–</dd>
+          </div>
+        </dl>
+        <p class="qa-hint">ms/frame is each path's own GPU time — they take turns on the GPU, so neither
+          is billed for the other's work. fps is what you actually see, turn-taking included.</p>
+        <div class="labels-found" id="liveQwenPills">
+          <span class="tag">none yet</span>
+        </div>
+      </div>
+
       <div class="card">
         <h2>Legend</h2>
         <div class="legend-row">
@@ -919,6 +1166,11 @@
           <span class="swatch" style="background:var(--qa)"></span>
           You confirmed it
           <span class="tag">yellow box</span>
+        </div>
+        <div class="legend-row qwen-only">
+          <span class="swatch" style="background:var(--qwen)"></span>
+          Found by Qwen3-VL direct
+          <span class="tag">green box</span>
         </div>
       </div>
 
@@ -1197,11 +1449,13 @@
   function sourceTag(source) {
     if (source === 'human') return 'confirmed';
     if (source === 'memory') return 'memory';
+    if (source === 'qwen') return 'qwen direct';
     return 'vlm';
   }
   function sourceColorVar(source) {
     if (source === 'human') return '--qa';
     if (source === 'memory') return '--memory';
+    if (source === 'qwen') return '--qwen';
     return '--vlm';
   }
   function renderLabelPills(container, labels) {
@@ -1297,6 +1551,101 @@
     }
   }
 
+  // The fetch() options /api/run takes for whatever is picked above (an upload, a sample
+  // image, or one video frame). /api/qwen-direct/run takes the exact same request, so the
+  // "Run Qwen direct" baseline always answers for the frame "Run detection" would use.
+  function buildRunRequest() {
+    const file = uploadInput.files[0];
+    if (file) {
+      const form = new FormData();
+      form.append('image', file);
+      return { method: 'POST', body: form };
+    }
+    const meta = sampleMeta[sampleSelect.value];
+    const body = { sample: sampleSelect.value };
+    if (meta && meta.kind === 'video') body.frame = Number(frameInput.value);
+    return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  }
+
+  // --- Qwen3-VL direct baseline (single image) --------------------------------
+  // Same image, but straight to the VLM: it has to find and name every object itself
+  // (whole-image grounding), with no detector or energy OOD split in front of it.
+  const qwenRunBtn = document.getElementById('qwenRunBtn');
+  const qwenConsole = document.getElementById('qwenConsole');
+  const qwenStatusPill = document.getElementById('qwenStatusPill');
+  const qwenStatusText = document.getElementById('qwenStatusText');
+  const qwenFrameImg = document.getElementById('qwenFrameImg');
+  const qwenFramePlaceholder = document.getElementById('qwenFramePlaceholder');
+  const qwenStatusRes = document.getElementById('qwenStatusRes');
+  const qwenStatusDet = document.getElementById('qwenStatusDet');
+  const qwenStatusModel = document.getElementById('qwenStatusModel');
+  const qwenLabelsPills = document.getElementById('qwenLabelsPills');
+  const qwenRawText = document.getElementById('qwenRawText');
+  const cmpPipeMs = document.getElementById('cmpPipeMs');
+  const cmpQwenMs = document.getElementById('cmpQwenMs');
+  const cmpPipeCount = document.getElementById('cmpPipeCount');
+  const cmpQwenCount = document.getElementById('cmpQwenCount');
+  const cmpNote = document.getElementById('cmpNote');
+
+  let lastPipelineRun = null;  // {source, ms, count} of the latest "Run detection"
+  let lastQwenRun = null;      // same, for the latest "Run Qwen direct"
+
+  function fmtMs(ms) {
+    return ms == null ? '–' : Math.round(ms).toLocaleString() + ' ms';
+  }
+  function fmtFps(fps) {
+    return fps == null ? '– fps' : fps.toFixed(fps < 1 ? 2 : 1) + ' fps';
+  }
+
+  function renderComparison() {
+    cmpPipeMs.textContent = lastPipelineRun ? fmtMs(lastPipelineRun.ms) : '–';
+    cmpPipeCount.textContent = lastPipelineRun ? lastPipelineRun.count : '–';
+    cmpQwenMs.textContent = lastQwenRun ? fmtMs(lastQwenRun.ms) : '–';
+    cmpQwenCount.textContent = lastQwenRun ? lastQwenRun.count : '–';
+    if (!lastPipelineRun || !lastQwenRun) {
+      cmpNote.textContent = 'run both "Run detection" and "Run Qwen direct" on the same image to compare them.';
+    } else if (lastPipelineRun.source !== lastQwenRun.source) {
+      cmpNote.textContent = 'these two runs used different inputs (pipeline: ' + lastPipelineRun.source +
+        ', Qwen: ' + lastQwenRun.source + ') — run both on the same image to compare.';
+    } else {
+      cmpNote.textContent = 'same input (' + lastQwenRun.source + '). Pipeline = detector + one VLM query per ' +
+        'new OOD object (cached objects cost 0 ms on a re-run); Qwen direct = one whole-image generation.';
+    }
+  }
+
+  async function runQwenDirect() {
+    qwenRunBtn.disabled = true;
+    qwenConsole.style.display = '';
+    qwenStatusPill.dataset.mode = 'running';
+    qwenStatusText.textContent = 'RUNNING';
+    setCtrlStatus('Qwen3-VL is looking at the whole image and writing out every box itself… this takes a few seconds.');
+    try {
+      const res = await fetch('/api/qwen-direct/run', buildRunRequest());
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'request failed');
+
+      setFrameSrc(qwenFrameImg, data.image);
+      qwenFrameImg.style.display = 'block';
+      qwenFramePlaceholder.style.display = 'none';
+      qwenStatusRes.textContent = data.resolution + ' · ' + data.source;
+      qwenStatusDet.innerHTML = '<b>' + data.count + '</b> objects';
+      qwenStatusModel.textContent = data.model_id || '–';
+      renderLabelPills(qwenLabelsPills, data.labels);
+      qwenRawText.textContent = data.raw_text || '(empty reply)';
+      lastQwenRun = { source: data.source, ms: data.timing.infer_ms, count: data.count };
+      renderComparison();
+      qwenStatusPill.dataset.mode = 'done';
+      qwenStatusText.textContent = 'DONE';
+      setCtrlStatus('Qwen direct done — ' + data.count + ' object(s) in ' + fmtMs(data.timing.infer_ms) + '.');
+    } catch (err) {
+      qwenStatusPill.dataset.mode = 'ready';
+      qwenStatusText.textContent = 'READY';
+      setCtrlStatus('Qwen direct error: ' + err.message, true);
+    } finally {
+      qwenRunBtn.disabled = false;
+    }
+  }
+
   async function runDetection() {
     runBtn.disabled = true;
     setMode('running', 'RUNNING');
@@ -1304,26 +1653,13 @@
     qaCard.style.display = 'none';
 
     try {
-      let res;
-      const file = uploadInput.files[0];
-      const meta = sampleMeta[sampleSelect.value];
-      if (file) {
-        const form = new FormData();
-        form.append('image', file);
-        res = await fetch('/api/run', { method: 'POST', body: form });
-      } else {
-        const body = { sample: sampleSelect.value };
-        if (meta && meta.kind === 'video') body.frame = Number(frameInput.value);
-        res = await fetch('/api/run', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-      }
+      const res = await fetch('/api/run', buildRunRequest());
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'request failed');
 
       currentJobId = data.job_id;
+      lastPipelineRun = { source: data.source, ms: data.timing.image_total_ms, count: data.stats.total };
+      renderComparison();
       setFrameSrc(frameImg, data.image);
       frameImg.style.display = 'block';
       framePlaceholder.style.display = 'none';
@@ -1394,6 +1730,7 @@
   }
 
   runBtn.addEventListener('click', runDetection);
+  qwenRunBtn.addEventListener('click', runQwenDirect);
   qaForm.addEventListener('submit', submitNames);
   sampleSelect.addEventListener('change', updateFrameStepper);
   uploadInput.addEventListener('change', updateFrameStepper);
@@ -1569,13 +1906,25 @@
       liveFrameImgOod.style.display = 'block';
       liveFramePlaceholderOod.style.display = 'none';
       liveStatusRes.innerHTML = data.resolution + ' <b>·</b> frame <b>' + data.frame_count + '</b>';
-      liveStatusDet.innerHTML = '<b>' + data.stats.total + '</b> detections';
+      // warming: the server shows the plain camera picture while its first pipeline pass runs;
+      // that (and Module 3's solo preview) has no detections yet, so no stats either.
+      liveStatusDet.innerHTML = '<b>' + (data.stats ? data.stats.total : 0) + '</b> detections';
       liveStatusEnergy.textContent = data.energy_thres;
+      if (data.warming) {
+        liveStatusPill.dataset.mode = 'needs-input';
+        liveStatusText.textContent = 'FIRST PASS';
+        liveStatus.textContent = 'camera connected · running the detector and VLM on the first frame…';
+        return;
+      }
+      renderLivePipelinePerf(data);
       renderLiveLabels(data.labels);
       renderLivePending(data.pending);
       announceLiveDetections(data);
       liveStatusPill.dataset.mode = data.pending.length ? 'needs-input' : 'done';
-      liveStatusText.textContent = data.pending.length ? 'NEEDS INPUT' : 'LIVE';
+      // frozen: the server stopped on this frame until every object below is named or dismissed;
+      // solo: Module 3 (Qwen direct) has the camera to itself, so the pipeline is paused.
+      liveStatusText.textContent = data.frozen ? 'PAUSED · NAME THEM' : data.solo ? 'PAUSED · MODULE 3 RUNNING'
+        : data.pending.length ? 'NEEDS INPUT' : 'LIVE';
       liveStatus.textContent = '';
     } catch (err) {
       liveStatusText.textContent = 'ERROR';
@@ -1596,10 +1945,188 @@
     liveToggleBtn.textContent = 'Start live view';
     if (livePollTimer) clearInterval(livePollTimer);
     livePollTimer = null;
+    if (qwenLiveOn) setQwenLiveEnabled(false);  // nobody's watching -- give the GPU back to the pipeline
   }
 
   liveToggleBtn.addEventListener('click', function () {
     if (livePolling) stopLive(); else startLive();
+  });
+
+  // --- Live comparison: Qwen3-VL direct on the same camera feed ----------------
+  // The titlebar toggle asks the server to start/stop its Qwen-direct worker
+  // (robot_web_app.py qwen_live_loop), which keeps running whole-image grounding on
+  // the newest frame the pipeline processed. It's several seconds per pass, so its
+  // image updates far less often than the pipeline's; both badges show ms/frame (own
+  // GPU time, the two take turns) and fps (observed, turn-taking included).
+  const liveQwenToggleBtn = document.getElementById('liveQwenToggleBtn');
+  const livePerfBadge = document.getElementById('livePerfBadge');
+  const liveQwenImg = document.getElementById('liveQwenImg');
+  const liveQwenPlaceholder = document.getElementById('liveQwenPlaceholder');
+  const liveQwenPerfBadge = document.getElementById('liveQwenPerfBadge');
+  const livePerfPipeMs = document.getElementById('livePerfPipeMs');
+  const livePerfPipeFps = document.getElementById('livePerfPipeFps');
+  const livePerfPipeCount = document.getElementById('livePerfPipeCount');
+  const livePerfQwenMs = document.getElementById('livePerfQwenMs');
+  const livePerfQwenFps = document.getElementById('livePerfQwenFps');
+  const livePerfQwenCount = document.getElementById('livePerfQwenCount');
+  const liveQwenPills = document.getElementById('liveQwenPills');
+  const QWEN_PLACEHOLDER_TEXT = liveQwenPlaceholder.textContent;
+
+  let qwenLiveOn = false;
+  let qwenLiveTimer = null;
+  let qwenLastRuns = null;  // only swap the image when the server has a new result (see pollQwenLiveOnce)
+  let qwenToggleLabel = liveQwenToggleBtn.textContent;  // renamed after the model in initLive
+
+  function renderLivePipelinePerf(data) {
+    const t = data.timing;
+    if (!t || !data.stats) return;
+    livePerfBadge.innerHTML = '<b>' + fmtMs(t.frame_ms) + '</b>/frame · ' + fmtFps(t.fps) +
+      ' · ' + data.stats.total + ' obj';
+    livePerfPipeMs.textContent = fmtMs(t.frame_ms);
+    livePerfPipeFps.textContent = fmtFps(t.fps);
+    livePerfPipeCount.textContent = data.stats.total;
+  }
+
+  function showQwenLive(on) {
+    qwenLiveOn = on;
+    liveConsole.classList.toggle('qwen-on', on);
+    showCompareResults(on);
+    liveQwenToggleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    liveQwenToggleBtn.textContent = on ? 'Stop Qwen3-VL comparison' : qwenToggleLabel;
+    if (qwenLiveTimer) clearInterval(qwenLiveTimer);
+    qwenLiveTimer = null;
+    if (!on) return;
+    liveQwenToggleBtn.title = 'Run Qwen3-VL on the whole live frame, no detector, side by side with this pipeline';
+    liveQwenImg.style.display = 'none';
+    liveQwenPlaceholder.style.display = '';
+    liveQwenPlaceholder.textContent = QWEN_PLACEHOLDER_TEXT;
+    liveQwenPerfBadge.innerHTML = '';
+    qwenLastRuns = null;
+    pollQwenLiveOnce();
+    qwenLiveTimer = setInterval(pollQwenLiveOnce, 1000);
+  }
+
+  async function setQwenLiveEnabled(enabled) {
+    liveQwenToggleBtn.disabled = true;
+    try {
+      const res = await fetch('/api/qwen-direct/live', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'request failed');
+      showQwenLive(data.enabled);
+      if (data.enabled && !livePolling) startLive();
+    } catch (err) {
+      liveStatus.textContent = 'Qwen direct: ' + err.message;
+    } finally {
+      liveQwenToggleBtn.disabled = false;
+    }
+  }
+
+  async function pollQwenLiveOnce() {
+    try {
+      const res = await fetch('/api/qwen-direct/live/latest');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'request failed');
+      if (data.error && !data.enabled) {
+        // The worker hit an error and switched itself off (see qwen_live_loop).
+        showQwenLive(false);
+        liveQwenToggleBtn.title = 'Qwen direct stopped: ' + data.error + ' — click to retry';
+        liveStatus.textContent = 'Qwen direct stopped: ' + data.error;
+        return;
+      }
+      // Setting the same data: URI again may not fire onload, which would leave the
+      // image stuck at opacity 0 (see setFrameSrc) -- so only swap on a new result.
+      if (!data.ready || data.runs === qwenLastRuns) return;
+      qwenLastRuns = data.runs;
+      setFrameSrc(liveQwenImg, data.image);
+      liveQwenImg.style.display = 'block';
+      liveQwenPlaceholder.style.display = 'none';
+      const t = data.timing || {};
+      liveQwenPerfBadge.innerHTML = '<b>' + fmtMs(t.infer_ms) + '</b>/frame · ' + fmtFps(t.fps) +
+        ' · ' + data.count + ' obj · frame ' + data.frame_count;
+      livePerfQwenMs.textContent = fmtMs(t.infer_ms);
+      livePerfQwenFps.textContent = fmtFps(t.fps);
+      livePerfQwenCount.textContent = data.count;
+      renderLabelPills(liveQwenPills, data.labels);
+    } catch (err) {
+      liveStatus.textContent = 'Qwen direct: ' + err.message;
+    }
+  }
+
+  liveQwenToggleBtn.addEventListener('click', function () {
+    setQwenLiveEnabled(!qwenLiveOn);
+  });
+
+  // ---- Comparison results panel (/api/compare/metrics) -------------------------------
+  const cmpBody = document.getElementById('cmpBody');
+  const cmpCount = document.getElementById('cmpCount');
+  let cmpTimer = null;
+
+  function showCompareResults(on) {
+    if (cmpTimer) clearInterval(cmpTimer);
+    cmpTimer = null;
+    if (!on) return;
+    pollCompareResults();
+    cmpTimer = setInterval(pollCompareResults, 2000);
+  }
+
+  function cmpCell(text, cls) {
+    const td = document.createElement('td');
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+  }
+
+  function renderCompareResults(data) {
+    const live = (data.summary && data.summary.live) || {};
+    const p = live.pipeline, q = live.qwen;
+    cmpCount.textContent = (p ? p.frames : 0) + ' + ' + (q ? q.frames : 0) + ' frames';
+    const fmtLabels = function (m) {
+      if (!m || !m.labels.length) return '–';
+      return m.labels.slice(0, 8).map(function (kv) { return kv[0] + ' ×' + kv[1]; }).join(', ') +
+        (m.labels.length > 8 ? ' …' : '');
+    };
+    const val = function (m, key, digits, suffix) {
+      return m && m[key] != null ? Number(m[key]).toFixed(digits) + (suffix || '') : '–';
+    };
+    const rows = [
+      ['Mean ms / frame', val(p, 'mean_ms', 0, ' ms'), val(q, 'mean_ms', 0, ' ms')],
+      ['Median ms / frame', val(p, 'median_ms', 0, ' ms'), val(q, 'median_ms', 0, ' ms')],
+      ['fps (own speed)', val(p, 'fps', 2), val(q, 'fps', 2)],
+      ['Objects / frame', val(p, 'mean_objects', 1), val(q, 'mean_objects', 1)],
+      ['Names given', fmtLabels(p), fmtLabels(q)],
+    ];
+    cmpBody.textContent = '';
+    rows.forEach(function (r, i) {
+      const last = i === rows.length - 1;
+      const tr = document.createElement('tr');
+      tr.appendChild(cmpCell(r[0]));
+      tr.appendChild(cmpCell(r[1], last ? 'lbl' : 'pipe'));
+      tr.appendChild(cmpCell(r[2], last ? 'lbl' : 'qwen'));
+      cmpBody.appendChild(tr);
+    });
+  }
+
+  async function pollCompareResults() {
+    try {
+      const res = await fetch('/api/compare/metrics', { cache: 'no-store' });
+      if (res.ok) renderCompareResults(await res.json());
+    } catch (err) { /* keep the last numbers; the next poll retries */ }
+  }
+
+  document.getElementById('cmpReset').addEventListener('click', async function () {
+    await fetch('/api/compare/metrics/reset', { method: 'POST' }).catch(function () {});
+    pollCompareResults();
+  });
+
+  // Don't leave the server's Qwen worker hogging GPU turns after the tab is gone.
+  window.addEventListener('pagehide', function () {
+    if (!qwenLiveOn || !navigator.sendBeacon) return;
+    navigator.sendBeacon('/api/qwen-direct/live',
+      new Blob([JSON.stringify({ enabled: false })], { type: 'application/json' }));
   });
 
   async function initLive() {
@@ -1608,7 +2135,29 @@
       const data = await res.json();
       if (data.enabled) {
         liveControls.style.display = '';
-        liveTopicLabel.textContent = 'ROS topic: ' + data.topic;
+        liveTopicLabel.textContent = data.source || ('ROS topic: ' + data.topic);
+        if (!data.topic) document.getElementById('liveWinName').textContent = 'robot_ood_detection · live (RealSense)';
+        liveQwenToggleBtn.style.display = '';
+        if (data.qwen_direct_model) {
+          qwenToggleLabel = 'Compare with ' + data.qwen_direct_model.split('/').pop() + ' direct';
+          liveQwenToggleBtn.textContent = qwenToggleLabel;
+        }
+        if (document.body.classList.contains('camera-only')) startLive();
+        // Pick the comparison back up if it's still running server-side (e.g. after a reload).
+        // ?compare=1 (the hub's "OOD + VLM vs VLM" scene) switches the comparison on by itself.
+        const wantCompare = new URLSearchParams(location.search).get('compare') === '1';
+        fetch('/api/qwen-direct/live/latest').then(function (r) { return r.json(); }).then(function (q) {
+          if (wantCompare && (!q.enabled || q.solo)) {
+            setQwenLiveEnabled(true);  // also takes the camera back from Module 3 running solo
+          } else if (q.enabled) {
+            showQwenLive(true);
+            if (!livePolling) startLive();
+          }
+        }).catch(function () {
+          if (wantCompare) setQwenLiveEnabled(true);  // otherwise the comparison stays off; the toggle still works
+        });
+      } else if (document.body.classList.contains('camera-only')) {
+        liveFramePlaceholder.textContent = 'no live camera — start robot_web_app.py with --realsense (or open ?full=1)';
       }
     } catch (err) {
       // no live mode available on this server; the single-frame demo above still works on its own

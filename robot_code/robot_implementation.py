@@ -81,11 +81,15 @@ from detectron2.config import get_cfg
 from core.setup import add_probabilistic_config
 from inference.inference_utils import build_predictor
 from utils.augmentations import letterbox
-from utils.dataloaders import IMG_FORMATS, VID_FORMATS
 from utils.general import scale_boxes
 from utils.plots import Annotator
 
 import ood_memory
+# Frame sources live in frame_sources.py (kept torch-free so robot_client.py can run on the
+# robot's laptop); re-exported here so existing `ri.iter_frames` etc. callers keep working.
+from frame_sources import (  # noqa: E402,F401
+    iter_frames, parse_realsense_source, realsense_iter_frames, ros_iter_frames,
+)
 
 VOC_NAME_MAPPING = {0: 'person', 1: 'bird', 2: 'cat', 3: 'cow', 4: 'dog', 5: 'horse', 6: 'sheep', 7: 'airplane',
                     8: 'bicycle', 9: 'boat', 10: 'bus', 11: 'car', 12: 'motorcycle', 13: 'train', 14: 'bottle',
@@ -132,7 +136,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=str, default=None,
                         help='image/video file, or an http(s)/rtsp stream URL (e.g. a web_video_server '
-                             'MJPEG stream like http://<host>:8081/stream?topic=...&type=mjpeg); '
+                             'MJPEG stream like http://<host>:8081/stream?topic=...&type=mjpeg), '
+                             'or "realsense" / "realsense:<serial>" for a USB RealSense via pyrealsense2; '
                              'omit (and omit --ros-topic) to stream from the local camera')
     parser.add_argument('--cam-index', type=int, default=0, help='camera index used when --source is omitted')
     parser.add_argument('--ros-topic', type=str, default=None,
@@ -187,138 +192,6 @@ def build_model(cfg_path, weights_path, conf_thres, device):
     cfg.MODEL.DEVICE = str(device)
     add_probabilistic_config(cfg)
     return build_predictor(cfg)
-
-
-def ros_iter_frames(topic, qos='sensor'):
-    """Yields (im0, False) pairs read from a ROS 2 sensor_msgs/Image topic, forever (until the
-    process is interrupted). im0 is a BGR HWC uint8 ndarray, converted from whatever encoding the
-    publisher uses via cv_bridge. rclpy is spun on a background thread; only the newest frame is
-    kept (a bounded queue of size 1) so a slow detector loop falls behind the camera instead of
-    building up latency."""
-    import queue
-    import threading
-
-    import rclpy
-    from cv_bridge import CvBridge
-    from rclpy.qos import QoSProfile, qos_profile_sensor_data
-    from sensor_msgs.msg import Image as RosImage
-
-    bridge = CvBridge()
-    frame_q = queue.Queue(maxsize=1)
-
-    def _on_image(msg):
-        im0 = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        if frame_q.full():
-            try:
-                frame_q.get_nowait()  # drop the stale frame; we only ever want the latest
-            except queue.Empty:
-                pass
-        frame_q.put(im0)
-
-    rclpy.init(args=None)
-    node = rclpy.create_node('samood_camera_subscriber')
-    qos_profile = qos_profile_sensor_data if qos == 'sensor' else QoSProfile(depth=10)
-    node.create_subscription(RosImage, topic, _on_image, qos_profile)
-
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
-    spin_thread.start()
-
-    print(f"[ros] subscribed to '{topic}' (qos={qos}); waiting for frames ...")
-    try:
-        while rclpy.ok():
-            yield frame_q.get(), False  # blocks until a frame arrives
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-def iter_frames(source, cam_index, ros_topic=None, ros_qos='sensor'):
-    """Yields (im0, is_last) pairs. im0 is a BGR HWC uint8 ndarray (original resolution)."""
-    if ros_topic is not None:
-        yield from ros_iter_frames(ros_topic, ros_qos)
-        return
-    if source is not None:
-        if source.startswith(('http://', 'https://', 'rtsp://')):
-            # A network video stream -- e.g. a web_video_server MJPEG URL such as
-            # http://<host>:8081/stream?topic=/camera/camera/color/image_raw&type=mjpeg.
-            # No rclpy/cv_bridge needed on this side: OpenCV/ffmpeg reads it like any
-            # other video source. Treated as endless, like the local camera branch below.
-            #
-            # Read continuously on a background thread and always hand the caller the
-            # newest frame, dropping any older ones still queued -- cv2.VideoCapture
-            # buffers frames as they arrive regardless of how often the caller asks for
-            # one, and read() returns the *oldest* buffered frame first. A caller that
-            # only pulls one frame every few seconds (e.g. robot_client.py's --interval)
-            # would otherwise silently fall further and further behind the live feed
-            # instead of staying in sync with it -- the same problem ros_iter_frames()
-            # above already avoids with its own bounded queue, mirrored here for a URL.
-            import queue
-            import threading
-
-            cap = cv2.VideoCapture(source)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open stream: {source}")
-
-            frame_q = queue.Queue(maxsize=1)
-            stopped = threading.Event()
-
-            def _reader():
-                while not stopped.is_set():
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        frame_q.put(None)  # signal failure to the consumer below
-                        return
-                    if frame_q.full():
-                        try:
-                            frame_q.get_nowait()  # drop the stale frame; keep only the newest
-                        except queue.Empty:
-                            pass
-                    frame_q.put(frame)
-
-            threading.Thread(target=_reader, daemon=True).start()
-            try:
-                while True:
-                    frame = frame_q.get()
-                    if frame is None:
-                        raise RuntimeError("Stream ended or failed to capture a frame")
-                    yield frame, False
-            finally:
-                stopped.set()
-                cap.release()
-            return
-        suffix = Path(source).suffix[1:].lower()
-        if suffix in IMG_FORMATS:
-            im0 = cv2.imread(source)
-            if im0 is None:
-                raise FileNotFoundError(f"Could not read image: {source}")
-            yield im0, True
-            return
-        elif suffix in VID_FORMATS:
-            cap = cv2.VideoCapture(source)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video file: {source}")
-            try:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        return
-                    yield frame, False
-            finally:
-                cap.release()
-        else:
-            raise ValueError(f"Unsupported source file type: {source}")
-    else:
-        cap = cv2.VideoCapture(cam_index)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open camera index {cam_index}")
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    raise RuntimeError("Camera opened but failed to capture a frame")
-                yield frame, False
-        finally:
-            cap.release()
 
 
 def preprocess(im0):

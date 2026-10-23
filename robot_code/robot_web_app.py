@@ -19,10 +19,24 @@ loading the checkpoint in-process -- start it first, in a separate terminal:
     python robot_code/robot_web_app.py
 
 Pass --no-vllm to load stage 1 locally instead (no server needed).
+
+The page can also run a "Qwen3-VL direct" baseline next to the pipeline: the same VLM
+gets the *whole* image and has to find + name every object itself (boxes and all), with no
+detector in front of it -- /api/qwen-direct/run for one image, /api/qwen-direct/live to
+toggle it on the --realsense/--ros-topic feed. The two take turns on the GPU (GPU_LOCK), so
+the ms/frame the page shows for each is that path's own compute time. Run on its own
+("Module 3", http://<host>:<port>/qwen-direct), it pauses the detector pipeline instead.
+
+The live view stops on a frame that still has objects nobody could name, until each one is
+named or dismissed on the page (--no-freeze to keep streaming).
 """
 import argparse
 import base64
+import csv
+import io
+import json
 import os
+import statistics
 import sys
 import threading
 import time
@@ -33,7 +47,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from PIL import Image
 
 FILE = Path(__file__).resolve()
@@ -43,8 +57,11 @@ if str(FILE.parent) not in sys.path:
 
 import robot_implementation as ri  # noqa: E402 (sets QWEN_MODEL_ID / sys.path on import)
 import ood_memory  # noqa: E402
+import robot_assistant  # noqa: E402
 
 PAGE_PATH = FILE.parent / "live_feed_demo.html"
+ASSISTANT_PAGE_PATH = FILE.parent / "robot_assistant.html"
+MODULE3_PAGE_PATH = FILE.parent / "qwen_direct.html"
 
 # Curated set of repo-root images that make decent demo material; anything
 # missing is silently skipped so this doesn't break if the repo changes.
@@ -76,6 +93,19 @@ for _name in SAMPLE_VIDEO_CANDIDATES:
     _path = ROOT / _name
     if _path.is_file():
         SAMPLES_BY_NAME[_name] = {"path": _path, "kind": "video", "frames": _video_frame_count(_path)}
+# Also offer anything dropped into the repo-root Samples/ folder, so new demo material
+# shows up in the picker without editing the candidate lists above.
+_SAMPLES_DIR = ROOT / "Samples"
+if _SAMPLES_DIR.is_dir():
+    for _path in sorted(_SAMPLES_DIR.iterdir()):
+        _name = f"Samples/{_path.name}"
+        _ext = _path.suffix.lower().lstrip(".")
+        if not _path.is_file() or _name in SAMPLES_BY_NAME:
+            continue
+        if _ext in ("jpg", "jpeg", "png", "bmp", "webp"):
+            SAMPLES_BY_NAME[_name] = {"path": _path, "kind": "image"}
+        elif _ext in ("mp4", "avi", "mov", "mkv", "webm"):
+            SAMPLES_BY_NAME[_name] = {"path": _path, "kind": "video", "frames": _video_frame_count(_path)}
 
 app = Flask(__name__)
 
@@ -89,13 +119,14 @@ CACHE = OrderedDict()  # same spatial LRU role as `cache` in robot_implementatio
 PREDICTOR = None
 ARGS = None
 MEMORY = None  # set in main(), once ARGS (--memory-path/--memory-sim-thres) is parsed
+LIVE_SOURCE = None  # human-readable label of the --ros-topic/--realsense feed, None if neither
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Live (pushed frames / robot_client.py) mode -------------------------------
 # Frames arriving at /api/run with live=1 (robot_client.py always sends this) also get
 # stashed here, so the page can poll /api/pushed/latest and show whatever a remote
 # client is streaming in -- no rclpy needed on this side at all (contrast the --ros-topic
-# / ros_live_loop path above, which needs rclpy in this same process). Each pushed frame
+# / live_loop path above, which needs rclpy in this same process). Each pushed frame
 # is an ordinary job_id in STATE, so stage 3 for it reuses the normal /api/submit/<job_id>
 # endpoint below -- the only addition there is writing resolved names back into the
 # shared CACHE so a name typed once actually resolves later frames near the same spot,
@@ -113,8 +144,8 @@ PUSHED_STATE = {
 # /api/pushed/label; it never disappears just because a later frame doesn't detect it.
 PUSHED_UNKNOWN = OrderedDict()
 
-# --- Live (--ros-topic) mode --------------------------------------------------
-# A background thread (ros_live_loop) continuously pulls frames from a ROS 2
+# --- Live (--ros-topic / --realsense) mode -------------------------------------
+# A background thread (live_loop) continuously pulls frames from a ROS 2
 # topic, runs the same detector + energy-OOD + VLM stage-1/2 pipeline as
 # api_run(), and publishes the latest result into LIVE_STATE for the page to
 # poll via /api/live/latest. Stage 3 (still-unknown objects) never blocks this
@@ -125,7 +156,7 @@ CACHE_LIVE = OrderedDict()
 LIVE_LOCK = threading.Lock()
 LIVE_STATE = {
     "ready": False, "error": None, "image": None, "image_ood": None, "resolution": None,
-    "stats": None, "labels": [], "known_labels": [], "pending": [], "frame_count": 0,
+    "stats": None, "labels": [], "known_labels": [], "pending": [], "frame_count": 0, "timing": None,
 }
 # Every still-unknown object ever seen on the ROS live loop, keyed by its spatial cache
 # key -- unlike LIVE_STATE["pending"] (which used to just be "whatever is unknown in the
@@ -135,6 +166,156 @@ LIVE_STATE = {
 # QA list on the page keeps accumulating instead of losing entries the operator hasn't
 # had a chance to name yet.
 LIVE_UNKNOWN = OrderedDict()
+# The --realsense/--ros-topic frame iterator, shared by live_loop and qwen_live_loop through
+# grab_frame(). Both sources drain whatever queued up and hand out the newest frame on every
+# next(), so each GPU pass grabs its frame only once the GPU is its own (see GPU_LOCK): a
+# pass always works on what the camera sees *now*, never on a frame that sat waiting while
+# the other path (or the previous several-second Qwen pass) had the GPU. A generator can't
+# be entered from two threads at once, hence FRAME_LOCK. FRAME_SEQ counts frames grabbed.
+LIVE_FRAMES = None
+FRAME_LOCK = threading.Lock()
+FRAME_SEQ = 0
+# Module 3 on its own: how often live_loop refreshes the plain camera picture the page shows
+# (it polls once a second). Grabbing + JPEG-encoding every camera frame instead only steals
+# CPU/GIL time from the Qwen pass's token-by-token generate() loop.
+SOLO_PREVIEW_INTERVAL = 0.25
+# Stop on the image (live loop): when a live frame still has objects both VLM stages called
+# "unknown", the live view stops on that frame until the operator has named or dismissed every
+# one of them, then goes live again (--no-freeze keeps streaming instead). Holds that frame,
+# its detections and the still-unnamed objects ("pending", keyed like LIVE_UNKNOWN), or None.
+# Guarded by LIVE_LOCK.
+LIVE_FROZEN = None
+
+# --- GPU turn-taking ------------------------------------------------------------
+# Held around each path's heavy compute (detector + VLM stages in api_run/live_loop, the
+# whole-image grounding call in run_qwen_direct/qwen_live_loop), so the pipeline and the
+# Qwen-direct baseline alternate on the GPU instead of slowing each other down mid-run. Every
+# timer that the page compares starts *after* acquiring it, so waiting for the other path's
+# turn never counts against either one. Lock order is always GPU_LOCK -> FRAME_LOCK and
+# GPU_LOCK -> qwen3_generator's own _GENERATE_LOCK, never the reverse.
+GPU_LOCK = threading.Lock()
+
+# --- Qwen-direct baseline (whole image -> VLM boxes + labels, no detector) -------
+QWEN_DIRECT_COLOR = (142, 207, 62)  # BGR green; matches --qwen in live_feed_demo.html
+QWEN_LIVE_ENABLED = threading.Event()  # set/cleared from the page via /api/qwen-direct/live
+# "Module 3" on its own: while set, live_loop skips the detector + VLM pipeline entirely (it only
+# refreshes the plain camera picture), so the Qwen-direct baseline gets the GPU to itself.
+# Set by /api/qwen-direct/live with {"enabled": true, "solo": true}; any other toggle clears it.
+QWEN_SOLO = threading.Event()
+QWEN_LIVE_LOCK = threading.Lock()
+QWEN_LIVE_STATE = {
+    "ready": False, "error": None, "image": None, "frame_count": None, "resolution": None,
+    "labels": [], "count": 0, "timing": None, "raw_text": "", "runs": 0, "model_id": None,
+    "session": 0,
+}
+
+# --- OOD + VLM vs VLM-only results (the page's "Comparison results" panel) --------
+# One row per finished frame of either method: the live pipeline (live_loop), the live
+# Qwen-direct baseline (qwen_live_loop, side by side or solo), and the single-image runs
+# (/api/run, /api/qwen-direct/run). Served as a per-method summary and as a CSV for the report.
+COMPARE_METHODS = {"pipeline": "OOD + VLM (detector + energy OOD + Qwen)", "qwen": "VLM only (Qwen3-VL direct)"}
+COMPARE_LOCK = threading.Lock()
+COMPARE_LOG = []
+COMPARE_LOG_MAX = 20000
+
+
+def compare_log(mode, method, source, frame, ms, n_objects, labels):
+    """mode: "live" or "image"; method: a COMPARE_METHODS key; labels: the names it gave."""
+    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": mode, "method": method, "source": source,
+           "frame": frame, "ms": round(float(ms), 1), "objects": int(n_objects), "labels": list(labels)}
+    with COMPARE_LOCK:
+        COMPARE_LOG.append(row)
+        del COMPARE_LOG[:-COMPARE_LOG_MAX]
+
+
+def pipeline_label_names(known_labels, resolved_labels):
+    return list(known_labels) + [r["label"] for r in resolved_labels]
+
+
+def compare_summary():
+    """{mode: {method: {frames, mean_ms, median_ms, fps, mean_objects, labels: [[name, n], ...]}}}.
+    fps is 1000 / mean ms: the rate the method manages on its own (the live loops take turns
+    on the GPU while compared, so their wall-clock fps there is lower for both)."""
+    with COMPARE_LOCK:
+        rows = list(COMPARE_LOG)
+    out = {}
+    for mode in ("live", "image"):
+        for method in COMPARE_METHODS:
+            sel = [r for r in rows if r["mode"] == mode and r["method"] == method]
+            if not sel:
+                continue
+            ms = [r["ms"] for r in sel]
+            counts = {}
+            for r in sel:
+                for name in r["labels"]:
+                    counts[name] = counts.get(name, 0) + 1
+            mean_ms = statistics.fmean(ms)
+            out.setdefault(mode, {})[method] = {
+                "frames": len(sel), "mean_ms": round(mean_ms, 1), "median_ms": round(statistics.median(ms), 1),
+                "fps": round(1000.0 / mean_ms, 2) if mean_ms > 0 else None,
+                "mean_objects": round(statistics.fmean(r["objects"] for r in sel), 2),
+                "labels": sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])),
+            }
+    return out
+
+
+# --- Robot assistant (/assistant page, robot_assistant.py) ----------------------
+# Fed every processed frame from both live paths (live_loop and robot_client.py pushes)
+# via assistant_observe(); answers "where are my X?" from them. Set in main().
+ASSISTANT = None
+# Last downscaled grayscale frame per live path, for flush_cache_on_motion().
+MOTION_PREV = {}
+
+
+def flush_cache_on_motion(name, im0, cache):
+    """CACHE/CACHE_LIVE are keyed by on-screen box position, which is only valid while the
+    camera stands still: once the robot drives or turns, a *different* object landing on the
+    same pixels would inherit the old object's name (and the assistant would cheerfully
+    report the wrong thing as found). So when consecutive frames of one path differ by more
+    than --motion-flush-thres (mean absolute difference of 160x90 grayscale thumbnails,
+    0-255), that path's spatial cache is cleared. Names a human gave survive anyway: CLIP
+    MEMORY re-recognizes those by appearance."""
+    if not ARGS.motion_flush_thres:
+        return False
+    small = cv2.cvtColor(cv2.resize(im0, (160, 90), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    prev = MOTION_PREV.get(name)
+    MOTION_PREV[name] = small
+    if prev is None:
+        return False
+    if float(cv2.absdiff(small, prev).mean()) > ARGS.motion_flush_thres:
+        cache.clear()
+        return True
+    return False
+
+
+def parse_depth_upload():
+    """robot_client.py --depth sends a 16-bit PNG (`depth`, millimetres, aligned to the color
+    frame but possibly smaller) plus the color intrinsics (`intrinsics` JSON). Returns the
+    depth_info dict scene_memory expects, or None if absent/malformed -- depth only adds
+    distances to the assistant's answers, so a bad upload must never fail the frame."""
+    f = request.files.get("depth")
+    if f is None:
+        return None
+    try:
+        depth_mm = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_UNCHANGED)
+        intr = json.loads(request.form.get("intrinsics") or "{}")
+        if depth_mm is None or depth_mm.dtype != np.uint16 or depth_mm.ndim != 2:
+            return None
+        return {"depth_mm": depth_mm, **{k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")}}
+    except (ValueError, KeyError, TypeError, cv2.error) as e:
+        print(f"[robot_web_app] ignoring malformed depth upload: {e}")
+        return None
+
+
+def assistant_observe(im0, boxes, labels, scores, ood_labels_by_row, preview_b64, depth_info, source):
+    """Hands one processed frame to the assistant. Never raises: a bug in the assistant
+    must not take the live detection pipeline down with it."""
+    if ASSISTANT is None:
+        return
+    try:
+        ASSISTANT.observe(im0, boxes, labels, scores, ood_labels_by_row, preview_b64, depth_info, source)
+    except Exception as e:
+        print(f"[robot_web_app] assistant observe failed: {e}")
 
 
 def cache_key_to_str(key):
@@ -294,30 +475,189 @@ def label_ood_detections_timed(im0, ood_boxes_xyxy, cache, verify_model_id, memo
     return results, timings
 
 
-def ros_live_loop(topic, qos):
-    """Runs forever on a background thread: pulls frames from a ROS 2 topic, runs the
-    real pipeline (batched, unlike label_ood_detections_timed above) with stage 3
+def update_fps(prev_fps, last_t, now, alpha=0.3):
+    """Exponential moving average of the wall-clock rate between successive results --
+    i.e. *observed* throughput, including any time spent waiting for the other path's GPU
+    turn (contrast the per-frame compute ms, which excludes it). None until two results."""
+    if last_t is None:
+        return prev_fps
+    inst = 1.0 / max(1e-6, now - last_t)
+    return inst if prev_fps is None else (1 - alpha) * prev_fps + alpha * inst
+
+
+def qwen_direct_model_id():
+    return ARGS.qwen_direct_model_id or os.environ.get("QWEN_MODEL_ID")
+
+
+def grab_frame():
+    """The live source's newest frame, as (im0, depth_info, seq). Thread-safe; see LIVE_FRAMES."""
+    global FRAME_SEQ
+    with FRAME_LOCK:
+        item = next(LIVE_FRAMES, None)
+        if item is None:
+            raise RuntimeError("the camera stream ended")
+        FRAME_SEQ += 1
+        seq = FRAME_SEQ
+    # (im0, is_last), or (im0, is_last, depth_info) from realsense_iter_frames(with_depth=True)
+    return item[0], (item[2] if len(item) > 2 else None), seq
+
+
+def qwen_direct_infer(im0):
+    """The baseline: one whole-image grounding call, no detector/OOD split/crops. The caller
+    holds GPU_LOCK. Returns (detections, raw_text, infer_ms)."""
+    from OOD_object_name_generation.qwen3_generator import detect_objects
+
+    img = Image.fromarray(cv2.cvtColor(im0, cv2.COLOR_BGR2RGB))
+    t0 = time.perf_counter()
+    detections, raw_text = detect_objects(
+        img, max_new_tokens=ARGS.qwen_direct_max_tokens, model_id=ARGS.qwen_direct_model_id,
+    )
+    return detections, raw_text, (time.perf_counter() - t0) * 1000
+
+
+def run_qwen_direct(im0):
+    """qwen_direct_infer() in its own GPU turn; infer_ms is timed inside GPU_LOCK (see its comment)."""
+    with GPU_LOCK:
+        return qwen_direct_infer(im0)
+
+
+def annotate_qwen_direct(im0, detections):
+    annotator = ri.Annotator(np.ascontiguousarray(im0), line_width=3, example=str(ri.VOC_NAME_MAPPING))
+    for det in detections:
+        # The VLM's labels are free text: the cv2 drawing path Annotator picks for an ASCII
+        # `example` has no fallback for anything else, so keep the drawn text ASCII.
+        text = det["label"].encode("ascii", "replace").decode("ascii")
+        annotator.box_label(det["box"], text, color=QWEN_DIRECT_COLOR)
+    return annotator.result()
+
+
+def qwen_direct_labels(detections):
+    # Same {label, source} shape as stats_and_labels()' resolved list, so the page's
+    # shared pill renderer handles it unchanged.
+    return sorted(({"label": det["label"], "source": "qwen"} for det in detections), key=lambda d: d["label"])
+
+
+def qwen_live_loop():
+    """Background worker for the live Qwen-direct comparison. Idles until the page sets
+    QWEN_LIVE_ENABLED, then runs the baseline back to back, each pass on the camera frame
+    current at the moment it gets the GPU (see LIVE_FRAMES) -- it's several seconds per pass,
+    so it naturally skips the frames in between. Side by side with Module 2 (not solo), it
+    waits for the pipeline to finish one frame between passes so the two take turns.
+    Like live_loop, never raises: an error is recorded for the page and the comparison
+    switches itself off."""
+    last_pipeline_frame = None
+    last_done_t = None
+    fps = None
+    session = None
+    while True:
+        QWEN_LIVE_ENABLED.wait()
+        with QWEN_LIVE_LOCK:
+            current_session = QWEN_LIVE_STATE["session"]
+        if current_session != session:  # toggled off and on again: start a new fps average
+            session, last_done_t, fps = current_session, None, None
+        if not QWEN_SOLO.is_set():
+            with LIVE_LOCK:
+                pipeline_frame = LIVE_STATE["frame_count"]
+                # Stopped on a frame, or crashed: the pipeline won't take a turn, don't wait for it.
+                pipeline_running = LIVE_FROZEN is None and not LIVE_STATE["error"]
+            if pipeline_running and pipeline_frame == last_pipeline_frame:
+                time.sleep(0.02)
+                continue
+            last_pipeline_frame = pipeline_frame
+        try:
+            with GPU_LOCK:
+                im0, _depth, frame_count = grab_frame()
+                detections, raw_text, infer_ms = qwen_direct_infer(im0)
+            image = encode_jpg(annotate_qwen_direct(im0.copy(), detections))
+        except Exception as e:
+            print(f"[robot_web_app] qwen-direct live loop error: {e}")
+            QWEN_LIVE_ENABLED.clear()
+            with QWEN_LIVE_LOCK:
+                QWEN_LIVE_STATE["error"] = str(e)
+            continue
+        now = time.perf_counter()
+        fps = update_fps(fps, last_done_t, now)
+        last_done_t = now
+        with QWEN_LIVE_LOCK:
+            QWEN_LIVE_STATE.update({
+                "ready": True, "error": None, "image": image, "frame_count": frame_count,
+                "resolution": f"{im0.shape[1]}x{im0.shape[0]}",
+                "labels": qwen_direct_labels(detections), "count": len(detections),
+                "timing": {"infer_ms": round(infer_ms, 1), "fps": round(fps, 2) if fps else None},
+                "raw_text": raw_text, "runs": QWEN_LIVE_STATE["runs"] + 1,
+                "model_id": qwen_direct_model_id(),
+            })
+        compare_log("live", "qwen", LIVE_SOURCE, frame_count, infer_ms, len(detections),
+                    [det["label"] for det in detections])
+
+
+def live_loop():
+    """Runs forever on a background thread: grabs frames from the live source (a ROS 2 topic
+    via ri.ros_iter_frames, or a USB RealSense via ri.realsense_iter_frames; see grab_frame),
+    runs the real pipeline (batched, unlike label_ood_detections_timed above) with stage 3
     disabled, and publishes each result into LIVE_STATE. Never raises into the caller
     -- on error it records the message into LIVE_STATE['error'] and stops, so a camera
-    hiccup surfaces on the page instead of silently killing the server."""
-    predictor = get_predictor()
-    try:
-        for im0, _is_last in ri.ros_iter_frames(topic, qos):
-            image_tensor, letterboxed_shape = ri.preprocess(im0)
-            with torch.no_grad():
-                results = ri.run_inference(predictor, image_tensor, letterboxed_shape)
-            boxes, labels, scores = ri.postprocess_energy(results, ARGS.energy_thres, ARGS.conf_thres)
+    hiccup surfaces on the page instead of silently killing the server.
 
-            ood_labels_by_row = {}
-            if len(boxes):
-                boxes = ri.scale_boxes(letterboxed_shape, boxes, im0.shape).round()
-                ood_idx = (labels == ri.OOD_CLASS_ID).nonzero(as_tuple=True)[0]
-                if ood_idx.numel():
-                    descriptions = ri.label_ood_detections(
-                        im0, boxes[ood_idx], CACHE_LIVE, ARGS.verify_model_id, human_qa_enabled=False,
-                        memory=MEMORY,
-                    )
-                    ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
+    Stops on a frame that still has unnamed objects (see LIVE_FROZEN), and runs no pipeline at
+    all while Module 3 has the camera to itself (QWEN_SOLO) -- then it only refreshes the
+    plain camera picture now and then (SOLO_PREVIEW_INTERVAL)."""
+    global LIVE_FROZEN
+    predictor = get_predictor()
+    last_done_t = None
+    fps = None
+    try:
+        while True:
+            if QWEN_SOLO.is_set():  # pipeline paused: the page shows the plain camera picture
+                im0, _depth, _seq = grab_frame()
+                raw_preview = encode_jpg(im0, max_dim=960, quality=80)
+                with LIVE_LOCK:
+                    LIVE_STATE.update({"ready": True, "error": None, "image": raw_preview,
+                                       "image_ood": raw_preview, "solo": True,
+                                       "resolution": f"{im0.shape[1]}x{im0.shape[0]}"})
+                time.sleep(SOLO_PREVIEW_INTERVAL)
+                continue
+            with LIVE_LOCK:
+                stopped = LIVE_FROZEN is not None
+            if stopped:
+                time.sleep(0.05)
+                continue
+            # Detector + VLM stages hold the GPU for one turn (see GPU_LOCK). The frame is
+            # grabbed only once the turn is ours, so after waiting out a Qwen-direct pass we
+            # work on the current frame, not one from several seconds ago; the timers start
+            # after the grab, so neither the wait nor the grab is billed here.
+            with GPU_LOCK:
+                im0, depth_info, seq = grab_frame()
+                with LIVE_LOCK:
+                    first_pass = LIVE_STATE["frame_count"] == 0
+                if first_pass:
+                    # The first pass is the slow one (first CUDA kernels, first VLM stage-2
+                    # escalation), so show the plain camera picture meanwhile instead of a page
+                    # stuck on "waiting for the first frame".
+                    raw_preview = encode_jpg(im0, max_dim=960, quality=80)
+                    with LIVE_LOCK:
+                        LIVE_STATE.update({"ready": True, "error": None, "image": raw_preview,
+                                           "image_ood": raw_preview, "warming": True,
+                                           "resolution": f"{im0.shape[1]}x{im0.shape[0]}"})
+                t0 = time.perf_counter()
+                image_tensor, letterboxed_shape = ri.preprocess(im0)
+                with torch.no_grad():
+                    results = ri.run_inference(predictor, image_tensor, letterboxed_shape)
+                boxes, labels, scores = ri.postprocess_energy(results, ARGS.energy_thres, ARGS.conf_thres)
+                detect_ms = (time.perf_counter() - t0) * 1000
+
+                ood_labels_by_row = {}
+                flush_cache_on_motion("live", im0, CACHE_LIVE)
+                if len(boxes):
+                    boxes = ri.scale_boxes(letterboxed_shape, boxes, im0.shape).round()
+                    ood_idx = (labels == ri.OOD_CLASS_ID).nonzero(as_tuple=True)[0]
+                    if ood_idx.numel():
+                        descriptions = ri.label_ood_detections(
+                            im0, boxes[ood_idx], CACHE_LIVE, ARGS.verify_model_id, human_qa_enabled=False,
+                            memory=MEMORY,
+                        )
+                        ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
+                frame_ms = (time.perf_counter() - t0) * 1000
 
             seen_unknown = []
             for row, (label, _src) in ood_labels_by_row.items():
@@ -328,6 +668,7 @@ def ros_live_loop(topic, qos):
                         "key": cache_key_to_str(ri.ood_cache_key(boxes[row])),
                         "box": [x1, y1, x2, y2],
                         "crop": encode_jpg(crop, max_dim=220) if crop.size else None,
+                        "row": int(row),
                     })
 
             preview = ri.annotate(im0.copy(), boxes, labels, scores, ood_labels_by_row)
@@ -337,24 +678,50 @@ def ros_live_loop(topic, qos):
             # Lets the page show that split side by side with the final VLM-labeled view.
             ood_preview = ri.annotate(im0.copy(), boxes, labels, scores, {})
             stats, resolved_labels, known_labels = stats_and_labels(labels, ood_labels_by_row, boxes)
+            preview_b64 = encode_jpg(preview)
+            now = time.perf_counter()
+            fps = update_fps(fps, last_done_t, now)
+            last_done_t = now
 
+            # Side by side with Qwen-direct, keep streaming: a stopped pipeline would leave the
+            # comparison with only one side moving (unknowns still collect in LIVE_UNKNOWN).
+            comparing = QWEN_LIVE_ENABLED.is_set() and not QWEN_SOLO.is_set()
             with LIVE_LOCK:
-                # Add/refresh this frame's still-unknown objects into the running list --
-                # never drop an entry here just because it's absent from *this* frame; see
-                # LIVE_UNKNOWN's docstring above for why. Only api_live_label removes one.
-                for item in seen_unknown:
-                    LIVE_UNKNOWN[item["key"]] = item
-                    LIVE_UNKNOWN.move_to_end(item["key"])
+                if seen_unknown and not ARGS.no_freeze and not comparing:
+                    # Stop on this frame: the page keeps showing it, and asks about exactly these
+                    # objects, until every one is named or dismissed (api_live_label).
+                    LIVE_FROZEN = {
+                        "im0": im0, "boxes": boxes, "labels": labels, "scores": scores,
+                        "ood_labels_by_row": dict(ood_labels_by_row),
+                        "pending": OrderedDict((it["key"], it) for it in seen_unknown),
+                    }
+                    pending = list(LIVE_FROZEN["pending"].values())
+                else:
+                    # Add/refresh this frame's still-unknown objects into the running list --
+                    # never drop an entry here just because it's absent from *this* frame; see
+                    # LIVE_UNKNOWN's docstring above for why. Only api_live_label removes one.
+                    for item in seen_unknown:
+                        LIVE_UNKNOWN[item["key"]] = item
+                        LIVE_UNKNOWN.move_to_end(item["key"])
+                    pending = list(LIVE_UNKNOWN.values())
+                frame_count = LIVE_STATE["frame_count"] + 1
                 LIVE_STATE.update({
                     "ready": True, "error": None,
-                    "image": encode_jpg(preview), "image_ood": encode_jpg(ood_preview),
+                    "image": preview_b64, "image_ood": encode_jpg(ood_preview),
                     "resolution": f"{im0.shape[1]}x{im0.shape[0]}",
                     "stats": stats, "labels": resolved_labels, "known_labels": known_labels,
-                    "pending": list(LIVE_UNKNOWN.values()),
-                    "frame_count": LIVE_STATE["frame_count"] + 1,
+                    "pending": pending, "frozen": LIVE_FROZEN is not None, "solo": False,
+                    "warming": False, "frame_count": frame_count,
+                    "timing": {
+                        "detect_ms": round(detect_ms, 1), "vlm_ms": round(frame_ms - detect_ms, 1),
+                        "frame_ms": round(frame_ms, 1), "fps": round(fps, 2) if fps else None,
+                    },
                 })
+            compare_log("live", "pipeline", LIVE_SOURCE, seq, frame_ms, stats["total"],
+                        pipeline_label_names(known_labels, resolved_labels))
+            assistant_observe(im0, boxes, labels, scores, ood_labels_by_row, preview_b64, depth_info, LIVE_SOURCE)
     except Exception as e:
-        print(f"[robot_web_app] live ROS loop stopped: {e}")
+        print(f"[robot_web_app] live loop stopped: {e}")
         with LIVE_LOCK:
             LIVE_STATE["error"] = str(e)
 
@@ -377,13 +744,16 @@ def api_sample_images():
 
 @app.route("/api/live/status")
 def api_live_status():
-    return jsonify({"enabled": ARGS.ros_topic is not None, "topic": ARGS.ros_topic})
+    return jsonify({
+        "enabled": LIVE_SOURCE is not None, "source": LIVE_SOURCE, "topic": ARGS.ros_topic,
+        "qwen_direct_model": qwen_direct_model_id(),
+    })
 
 
 @app.route("/api/live/latest")
 def api_live_latest():
-    if ARGS.ros_topic is None:
-        return jsonify({"error": "server was not started with --ros-topic"}), 400
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
     with LIVE_LOCK:
         snapshot = dict(LIVE_STATE)
     if snapshot["error"]:
@@ -396,8 +766,8 @@ def api_live_latest():
 
 @app.route("/api/live/label", methods=["POST"])
 def api_live_label():
-    if ARGS.ros_topic is None:
-        return jsonify({"error": "server was not started with --ros-topic"}), 400
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
     payload = request.get_json(silent=True) or {}
     key_str = payload.get("key")
     if not key_str:
@@ -426,11 +796,38 @@ def api_live_label():
         # list until someone actually names or dismisses it.
         with LIVE_LOCK:
             entry = LIVE_UNKNOWN.pop(key_str, None)
+            frozen_entry = LIVE_FROZEN["pending"].pop(key_str, None) if LIVE_FROZEN is not None else None
+        entry = entry or frozen_entry
+        if frozen_entry is not None:
+            update_frozen_view(frozen_entry["row"], ("dismissed", "dismissed") if dismiss else (typed, "human"))
         if typed and MEMORY is not None and entry:
             crop = decode_jpg_b64(entry.get("crop"))
             if crop is not None:
                 MEMORY.remember(crop, typed)
     return jsonify({"ok": True})
+
+
+def update_frozen_view(row, resolved):
+    """Draws a just-given name (or a dismissal) onto the frame the live view stopped on, and
+    goes live again once nothing on it is left unnamed."""
+    global LIVE_FROZEN
+    with LIVE_LOCK:
+        fz = LIVE_FROZEN
+        if fz is None:
+            return
+        fz["ood_labels_by_row"][row] = resolved
+        pending = list(fz["pending"].values())
+        if not pending:
+            LIVE_FROZEN = None
+            LIVE_STATE.update({"frozen": False, "pending": list(LIVE_UNKNOWN.values())})
+            return
+        im0, boxes, labels, scores, ood = fz["im0"], fz["boxes"], fz["labels"], fz["scores"], dict(fz["ood_labels_by_row"])
+    preview = encode_jpg(ri.annotate(im0.copy(), boxes, labels, scores, ood))
+    stats, resolved_labels, known_labels = stats_and_labels(labels, ood, boxes)
+    with LIVE_LOCK:
+        if LIVE_FROZEN is fz:
+            LIVE_STATE.update({"image": preview, "stats": stats, "labels": resolved_labels,
+                               "known_labels": known_labels, "pending": pending})
 
 
 @app.route("/api/pushed/latest")
@@ -506,26 +903,62 @@ def api_memory_delete():
     return jsonify({"removed": removed, "entries": MEMORY.list_entries()})
 
 
-@app.route("/api/run", methods=["POST"])
-def api_run():
-    frame_idx = None
-    frame_count = None
-    is_live = False
+# --- Robot assistant ("Robot, where are my headphones?") -------------------------
+@app.route("/assistant")
+def assistant_page():
+    return send_from_directory(ASSISTANT_PAGE_PATH.parent, ASSISTANT_PAGE_PATH.name)
+
+
+@app.route("/api/assistant/ask", methods=["POST"])
+def api_assistant_ask():
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "missing text"}), 400
+    return jsonify(ASSISTANT.ask(text))
+
+
+@app.route("/api/assistant/state")
+def api_assistant_state():
+    return jsonify(ASSISTANT.state(request.args.get("since", default=0, type=int)))
+
+
+@app.route("/api/assistant/snapshot/<path:key>")
+def api_assistant_snapshot(key):
+    jpg = ASSISTANT.scene.snapshot_jpg(key)
+    if jpg is None:
+        return jsonify({"error": f"haven't seen {key!r}"}), 404
+    return Response(jpg, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/assistant/cancel", methods=["POST"])
+def api_assistant_cancel():
+    payload = request.get_json(silent=True) or {}
+    return jsonify(ASSISTANT.cancel(payload.get("target")))
+
+
+def load_request_frame():
+    """Decodes the frame an /api/run-style request asks for: an uploaded file (multipart
+    `image`, plus robot_client.py's `live`/`skip_vlm` form flags), a sample image, or one
+    frame of a sample video (JSON `sample` + optional `frame`). Shared by /api/run and
+    /api/qwen-direct/run so both answer for exactly the same frame. Returns (frame, None)
+    -- frame a dict of im0/source_name/frame_idx/frame_count/is_live/skip_vlm -- or
+    (None, error_response) for the route to return as-is."""
+    frame = {"frame_idx": None, "frame_count": None, "is_live": False, "skip_vlm": False}
 
     if "image" in request.files and request.files["image"].filename:
         f = request.files["image"]
         data = np.frombuffer(f.read(), np.uint8)
-        im0 = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        source_name = f.filename
-        is_live = request.form.get("live") == "1"
-        skip_vlm = request.form.get("skip_vlm") == "1"
+        frame["im0"] = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        frame["source_name"] = f.filename
+        frame["is_live"] = request.form.get("live") == "1"
+        frame["skip_vlm"] = request.form.get("skip_vlm") == "1"
     else:
-        skip_vlm = False
         payload = request.get_json(silent=True) or {}
         name = payload.get("sample")
         entry = SAMPLES_BY_NAME.get(name)
         if entry is None:
-            return jsonify({"error": f"unknown sample: {name!r}"}), 400
+            return None, (jsonify({"error": f"unknown sample: {name!r}"}), 400)
 
         if entry["kind"] == "video":
             frame_count = entry["frames"]
@@ -538,69 +971,201 @@ def api_run():
                 ok, im0 = cap.read()
             finally:
                 cap.release()
-            if not ok:
-                im0 = None
-            source_name = f"{name} — frame {frame_idx}/{frame_count - 1}"
+            frame.update({
+                "im0": im0 if ok else None, "frame_idx": frame_idx, "frame_count": frame_count,
+                "source_name": f"{name} — frame {frame_idx}/{frame_count - 1}",
+            })
         else:
-            im0 = cv2.imread(str(entry["path"]))
-            source_name = name
+            frame["im0"] = cv2.imread(str(entry["path"]))
+            frame["source_name"] = name
 
-    if im0 is None:
-        return jsonify({"error": "could not decode image/frame"}), 400
+    if frame["im0"] is None:
+        return None, (jsonify({"error": "could not decode image/frame"}), 400)
+    return frame, None
 
-    t_detect0 = time.perf_counter()
-    image_tensor, letterboxed_shape = ri.preprocess(im0)
-    with torch.no_grad():
-        results = ri.run_inference(get_predictor(), image_tensor, letterboxed_shape)
-    boxes, labels, scores = ri.postprocess_energy(results, ARGS.energy_thres, ARGS.conf_thres)
-    detect_ms = (time.perf_counter() - t_detect0) * 1000  # preprocess + detector fwd pass + energy split
+
+@app.route("/api/qwen-direct/run", methods=["POST"])
+def api_qwen_direct_run():
+    """The Qwen-direct baseline on one sample/upload -- same request shape as /api/run."""
+    frame, error = load_request_frame()
+    if error:
+        return error
+    im0 = frame["im0"]
+    try:
+        detections, raw_text, infer_ms = run_qwen_direct(im0)
+    except Exception as e:  # e.g. vLLM server unreachable -- show it on the page, not as an HTML 500
+        return jsonify({"error": f"Qwen direct failed: {e}"}), 500
+    compare_log("image", "qwen", frame["source_name"], frame["frame_idx"], infer_ms, len(detections),
+                [det["label"] for det in detections])
+    return jsonify({
+        "image": encode_jpg(annotate_qwen_direct(im0.copy(), detections)),
+        "source": frame["source_name"],
+        "resolution": f"{im0.shape[1]}x{im0.shape[0]}",
+        "frame_idx": frame["frame_idx"],
+        "frame_count": frame["frame_count"],
+        "labels": qwen_direct_labels(detections),
+        "count": len(detections),
+        "timing": {"infer_ms": round(infer_ms, 1)},
+        "raw_text": raw_text,
+        "model_id": qwen_direct_model_id(),
+    })
+
+
+@app.route("/qwen-direct")
+def qwen_direct_page():
+    """Module 3's own page: the Qwen-direct baseline running alone on the live camera."""
+    return send_from_directory(MODULE3_PAGE_PATH.parent, MODULE3_PAGE_PATH.name)
+
+
+@app.route("/api/qwen-direct/live", methods=["POST"])
+def api_qwen_direct_live():
+    """{"enabled": bool, "solo": bool}. solo = Module 3 on its own: the detector + VLM pipeline
+    pauses (see QWEN_SOLO) so the Qwen-direct baseline gets the GPU to itself. Without solo
+    it's the Module 2 page's side-by-side comparison."""
+    global LIVE_FROZEN
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
+    payload = request.get_json(silent=True) or {}
+    if payload.get("enabled") and (payload.get("solo") or not QWEN_LIVE_ENABLED.is_set()):
+        # Module 3 has nothing to name, and the comparison keeps the pipeline streaming (see
+        # live_loop): drop a stopped frame; its unknown objects stay in the to-name list.
+        with LIVE_LOCK:
+            if LIVE_FROZEN is not None:
+                for item in LIVE_FROZEN["pending"].values():
+                    LIVE_UNKNOWN[item["key"]] = item
+                LIVE_FROZEN = None
+                LIVE_STATE.update({"frozen": False, "pending": list(LIVE_UNKNOWN.values())})
+    if payload.get("enabled") and payload.get("solo"):
+        QWEN_SOLO.set()
+    else:
+        QWEN_SOLO.clear()
+    if payload.get("enabled"):
+        if not QWEN_LIVE_ENABLED.is_set():
+            # A fresh comparison: drop the previous one's last frame/timing so the page
+            # doesn't show a stale result, and bump `session` so qwen_live_loop restarts its
+            # fps average instead of counting the time it sat switched off.
+            with QWEN_LIVE_LOCK:
+                QWEN_LIVE_STATE.update({
+                    "ready": False, "error": None, "image": None, "timing": None,
+                    "session": QWEN_LIVE_STATE["session"] + 1,
+                })
+        QWEN_LIVE_ENABLED.set()
+    else:
+        QWEN_LIVE_ENABLED.clear()
+    return jsonify({"enabled": QWEN_LIVE_ENABLED.is_set(), "solo": QWEN_SOLO.is_set()})
+
+
+@app.route("/api/qwen-direct/live/latest")
+def api_qwen_direct_live_latest():
+    """?light=1 leaves out the image and the raw model reply (for status polling)."""
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
+    with QWEN_LIVE_LOCK:
+        snapshot = dict(QWEN_LIVE_STATE)
+    snapshot["enabled"] = QWEN_LIVE_ENABLED.is_set()
+    snapshot["solo"] = QWEN_SOLO.is_set()
+    if request.args.get("light"):
+        snapshot.pop("image", None)
+        snapshot.pop("raw_text", None)
+    return jsonify(snapshot)
+
+
+@app.route("/api/compare/metrics")
+def api_compare_metrics():
+    with COMPARE_LOCK:
+        n_rows = len(COMPARE_LOG)
+    return jsonify({"methods": COMPARE_METHODS, "summary": compare_summary(), "rows": n_rows})
+
+
+@app.route("/api/compare/metrics.csv")
+def api_compare_metrics_csv():
+    with COMPARE_LOCK:
+        rows = list(COMPARE_LOG)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["time", "mode", "method", "source", "frame", "ms", "objects", "labels"])
+    for r in rows:
+        writer.writerow([r["time"], r["mode"], COMPARE_METHODS[r["method"]], r["source"], r["frame"], r["ms"],
+                         r["objects"], "; ".join(r["labels"])])
+    name = f"ood_vlm_vs_vlm_only_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response("﻿" + buf.getvalue(), mimetype="text/csv",  # BOM: Excel reads it as UTF-8
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
+
+
+@app.route("/api/compare/metrics/reset", methods=["POST"])
+def api_compare_metrics_reset():
+    with COMPARE_LOCK:
+        COMPARE_LOG.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    frame, error = load_request_frame()
+    if error:
+        return error
+    im0, source_name = frame["im0"], frame["source_name"]
+    frame_idx, frame_count = frame["frame_idx"], frame["frame_count"]
+    is_live, skip_vlm = frame["is_live"], frame["skip_vlm"]
+    depth_info = parse_depth_upload() if is_live else None  # robot_client.py --depth
 
     ood_labels_by_row = {}
     pending_rows = []
     per_object_timing = []
     vlm_ms = 0.0
-    if len(boxes):
-        boxes = ri.scale_boxes(letterboxed_shape, boxes, im0.shape).round()
-        ood_idx = (labels == ri.OOD_CLASS_ID).nonzero(as_tuple=True)[0]
-        if ood_idx.numel() and skip_vlm:
-            # Detector + energy-OOD split only -- no VLM calls, no pending/QA. Just labels
-            # every OOD box "ood" so the stream stays fast and simple to watch; --skip-vlm
-            # on robot_client.py sends this.
-            ood_labels_by_row = {int(row): ("ood", "vlm1") for row in ood_idx.tolist()}
-        elif ood_idx.numel() and is_live:
-            # Live push path (robot_client.py): use the real batched production pipeline
-            # (one VLM call per frame covering every OOD object in it, same as the
-            # --ros-topic live loop below) instead of label_ood_detections_timed's
-            # one-object-at-a-time calls. The per-object timing breakdown is a demo/debug
-            # feature for manual sample-image runs in the browser -- nothing reads it for
-            # pushed frames (robot_client.py only prints detect_ms/vlm_total_ms) -- so it
-            # was pure overhead here: N sequential generate() calls instead of one batched
-            # call, each paying its own tokenization + CUDA-launch + KV-cache-alloc cost.
-            t_vlm0 = time.perf_counter()
-            descriptions = ri.label_ood_detections(
-                im0, boxes[ood_idx], CACHE, ARGS.verify_model_id, human_qa_enabled=False,
-                memory=MEMORY,
-            )
-            vlm_ms = (time.perf_counter() - t_vlm0) * 1000
-            ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
-            pending_rows = [row for row, (label, _src) in ood_labels_by_row.items() if ri._is_unknown(label)]
-        elif ood_idx.numel():
-            # Manual/demo path (sample-image button clicks, not a robot_client.py push):
-            # stages 1 + 2 only, stage 3 (still unknown) comes back to the caller instead
-            # of blocking on cv2/stdin -- same resolution logic as ri.label_ood_detections
-            # with human_qa_enabled=False, but timed per-object (see the function
-            # docstring) so the demo page can show a real single-query latency number.
-            t_vlm0 = time.perf_counter()
-            descriptions, timings = label_ood_detections_timed(
-                im0, boxes[ood_idx], CACHE, ARGS.verify_model_id, memory=MEMORY,
-            )
-            vlm_ms = (time.perf_counter() - t_vlm0) * 1000
-            ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
-            pending_rows = [row for row, (label, _src) in ood_labels_by_row.items() if ri._is_unknown(label)]
-            for row, desc, timing in zip(ood_idx.tolist(), descriptions, timings):
-                per_object_timing.append({
-                    "row": int(row), "label": desc[0], "source": desc[1], **timing,
-                })
+    # One GPU turn for the detector + VLM stages (see GPU_LOCK); timers start inside it.
+    with GPU_LOCK:
+        t_detect0 = time.perf_counter()
+        image_tensor, letterboxed_shape = ri.preprocess(im0)
+        with torch.no_grad():
+            results = ri.run_inference(get_predictor(), image_tensor, letterboxed_shape)
+        boxes, labels, scores = ri.postprocess_energy(results, ARGS.energy_thres, ARGS.conf_thres)
+        detect_ms = (time.perf_counter() - t_detect0) * 1000  # preprocess + detector fwd pass + energy split
+
+        if is_live:
+            flush_cache_on_motion("pushed", im0, CACHE)
+        if len(boxes):
+            boxes = ri.scale_boxes(letterboxed_shape, boxes, im0.shape).round()
+            ood_idx = (labels == ri.OOD_CLASS_ID).nonzero(as_tuple=True)[0]
+            if ood_idx.numel() and skip_vlm:
+                # Detector + energy-OOD split only -- no VLM calls, no pending/QA. Just labels
+                # every OOD box "ood" so the stream stays fast and simple to watch; --skip-vlm
+                # on robot_client.py sends this.
+                ood_labels_by_row = {int(row): ("ood", "vlm1") for row in ood_idx.tolist()}
+            elif ood_idx.numel() and is_live:
+                # Live push path (robot_client.py): use the real batched production pipeline
+                # (one VLM call per frame covering every OOD object in it, same as the
+                # --ros-topic live loop below) instead of label_ood_detections_timed's
+                # one-object-at-a-time calls. The per-object timing breakdown is a demo/debug
+                # feature for manual sample-image runs in the browser -- nothing reads it for
+                # pushed frames (robot_client.py only prints detect_ms/vlm_total_ms) -- so it
+                # was pure overhead here: N sequential generate() calls instead of one batched
+                # call, each paying its own tokenization + CUDA-launch + KV-cache-alloc cost.
+                t_vlm0 = time.perf_counter()
+                descriptions = ri.label_ood_detections(
+                    im0, boxes[ood_idx], CACHE, ARGS.verify_model_id, human_qa_enabled=False,
+                    memory=MEMORY,
+                )
+                vlm_ms = (time.perf_counter() - t_vlm0) * 1000
+                ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
+                pending_rows = [row for row, (label, _src) in ood_labels_by_row.items() if ri._is_unknown(label)]
+            elif ood_idx.numel():
+                # Manual/demo path (sample-image button clicks, not a robot_client.py push):
+                # stages 1 + 2 only, stage 3 (still unknown) comes back to the caller instead
+                # of blocking on cv2/stdin -- same resolution logic as ri.label_ood_detections
+                # with human_qa_enabled=False, but timed per-object (see the function
+                # docstring) so the demo page can show a real single-query latency number.
+                t_vlm0 = time.perf_counter()
+                descriptions, timings = label_ood_detections_timed(
+                    im0, boxes[ood_idx], CACHE, ARGS.verify_model_id, memory=MEMORY,
+                )
+                vlm_ms = (time.perf_counter() - t_vlm0) * 1000
+                ood_labels_by_row = {int(row): desc for row, desc in zip(ood_idx.tolist(), descriptions)}
+                pending_rows = [row for row, (label, _src) in ood_labels_by_row.items() if ri._is_unknown(label)]
+                for row, desc, timing in zip(ood_idx.tolist(), descriptions, timings):
+                    per_object_timing.append({
+                        "row": int(row), "label": desc[0], "source": desc[1], **timing,
+                    })
 
     job_id = uuid.uuid4().hex
     STATE[job_id] = {
@@ -637,7 +1202,7 @@ def api_run():
 
     if is_live:
         with PUSHED_LOCK:
-            # Same accumulate-until-named pattern as LIVE_UNKNOWN/ros_live_loop above,
+            # Same accumulate-until-named pattern as LIVE_UNKNOWN/live_loop above,
             # keyed by spatial position instead of this frame's job_id -- every pushed
             # frame gets a fresh job_id, so keying off it would wipe the list on every
             # single frame (that was the bug: the QA list never accumulated).
@@ -653,8 +1218,13 @@ def api_run():
                 "energy_thres": ARGS.energy_thres,
                 "frame_count": PUSHED_STATE["frame_count"] + 1,
             })
+        assistant_observe(im0, boxes, labels, scores, ood_labels_by_row, image_b64, depth_info,
+                          f"robot_client.py ({source_name})")
 
-    n_queried = sum(1 for t in per_object_timing if not t["cached"])
+    if not is_live:  # sample/upload runs only; robot_client.py pushes aren't part of the comparison
+        compare_log("image", "pipeline", source_name, frame_idx, detect_ms + vlm_ms, stats["total"],
+                    pipeline_label_names(known_labels, resolved_labels))
+    n_queried =sum(1 for t in per_object_timing if not t["cached"])
     return jsonify({
         "job_id": job_id,
         "source": source_name,
@@ -734,6 +1304,11 @@ def parse_args():
                              "browser on the robot's network to watch the stream and resolve unknowns "
                              "without needing a display on the robot itself. Requires rclpy + cv_bridge "
                              "on this Python path (source your ROS 2 setup.bash first).")
+    parser.add_argument("--realsense", nargs="?", const="", default=None, metavar="SERIAL",
+                        help="stream a USB-attached Intel RealSense's color camera straight into the "
+                             "page's live section via pyrealsense2 (no ROS needed). Optionally give a "
+                             "serial number to pick one camera when several are plugged in. Ignored "
+                             "if --ros-topic is also set.")
     parser.add_argument("--ros-qos", choices=["sensor", "default"], default="sensor",
                         help="QoS profile for --ros-topic; see robot_implementation.py --ros-qos.")
     parser.add_argument("--vllm-url", type=str, default=ri.DEFAULT_VLLM_URL,
@@ -756,13 +1331,39 @@ def parse_args():
                              "robot_implementation.py --memory-sim-thres / ood_memory.OODMemory")
     parser.add_argument("--no-memory", action="store_true",
                         help="disable the appearance-based memory lookup entirely")
+    parser.add_argument("--no-freeze", action="store_true",
+                        help="live view: keep streaming when a frame has objects nobody could name, instead "
+                             "of stopping on that frame until each one is named or dismissed")
+    parser.add_argument("--qwen-direct-model-id", type=str, default=None,
+                        help="checkpoint for the page's 'Qwen3-VL direct' baseline (whole image -> "
+                             "boxes + labels, no detector). Default: the stage-1 model "
+                             "(QWEN_MODEL_ID), which is already loaded, so no extra VRAM.")
+    parser.add_argument("--qwen-direct-max-tokens", type=int, default=1024,
+                        help="generation budget for one Qwen-direct grounding reply (~25 tokens "
+                             "per object found); output cut off at this limit still keeps "
+                             "every complete box")
+    parser.add_argument("--depth", action="store_true",
+                        help="with --realsense: also stream aligned depth, so the /assistant page can say "
+                             "how far away and in which direction a found object is. (For a RealSense on "
+                             "another machine, pass --depth to robot_client.py instead.)")
+    parser.add_argument("--motion-flush-thres", type=float, default=10.0,
+                        help="clear a live path's spatial label cache when consecutive frames differ by "
+                             "more than this (mean abs. difference of 160x90 grayscale thumbnails, 0-255) "
+                             "-- i.e. the robot moved, so screen-position cache keys no longer point at "
+                             "the same objects. 0 disables.")
+    parser.add_argument("--no-grounding", action="store_true",
+                        help="/assistant: don't fall back to asking Qwen3-VL to find an object in the "
+                             "whole frame when the detector hasn't seen it")
     return parser.parse_args()
 
 
 def main():
-    global ARGS, MEMORY
+    global ARGS, MEMORY, LIVE_SOURCE, ASSISTANT, LIVE_FRAMES
     ARGS = parse_args()
     MEMORY = None if ARGS.no_memory else ood_memory.OODMemory(ARGS.memory_path, ARGS.memory_sim_thres)
+    ASSISTANT = robot_assistant.Assistant(
+        voc_names=ri.VOC_NAME_MAPPING, ood_class_id=ri.OOD_CLASS_ID, grounding=not ARGS.no_grounding,
+    )
 
     # See robot_implementation.main() -- same env var, same "must be set before the first
     # lazy describe_images() import" requirement. The warmup call a few lines down is
@@ -790,11 +1391,20 @@ def main():
     from OOD_object_name_generation.qwen3_generator import describe_images
     describe_images([Image.new("RGB", (64, 64))], max_new_tokens=1, batch_size=1)
     print(f"[robot_web_app] VLM warm ({(time.perf_counter() - t0) * 1000:.0f} ms). "
-          f"Open http://{ARGS.host}:{ARGS.port}/ in a browser.")
+          f"Open http://{ARGS.host}:{ARGS.port}/ in a browser "
+          f"(robot assistant: http://{ARGS.host}:{ARGS.port}/assistant).")
 
     if ARGS.ros_topic:
-        print(f"[robot_web_app] starting live ROS loop on '{ARGS.ros_topic}' (qos={ARGS.ros_qos}) ...")
-        threading.Thread(target=ros_live_loop, args=(ARGS.ros_topic, ARGS.ros_qos), daemon=True).start()
+        LIVE_SOURCE = f"ROS topic: {ARGS.ros_topic}"
+        LIVE_FRAMES = ri.ros_iter_frames(ARGS.ros_topic, ARGS.ros_qos)
+    elif ARGS.realsense is not None:
+        LIVE_SOURCE = "RealSense camera" + (f" {ARGS.realsense}" if ARGS.realsense else "")
+        LIVE_FRAMES = ri.realsense_iter_frames(ARGS.realsense or None, with_depth=ARGS.depth)
+    if LIVE_SOURCE:
+        print(f"[robot_web_app] starting live loop on {LIVE_SOURCE} ...")
+        threading.Thread(target=live_loop, daemon=True).start()
+        # Idle until the page's "Compare with Qwen3-VL direct" toggle sets QWEN_LIVE_ENABLED.
+        threading.Thread(target=qwen_live_loop, daemon=True).start()
 
     app.run(host=ARGS.host, port=ARGS.port, debug=False, use_reloader=False, threaded=True)
 

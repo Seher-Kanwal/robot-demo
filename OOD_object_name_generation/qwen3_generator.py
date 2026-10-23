@@ -1,11 +1,13 @@
 import base64
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from PIL import Image, ImageOps
 import os
+import threading
 import torch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, StoppingCriteria, StoppingCriteriaList
 import re
 
 try:
@@ -32,6 +34,12 @@ _VLLM_MODEL_ID = os.getenv("QWEN_VLLM_MODEL_ID") or MODEL_ID
 _VLLM_TIMEOUT = float(os.getenv("QWEN_VLLM_TIMEOUT", "30"))
 _VLLM_MAX_WORKERS = int(os.getenv("QWEN_VLLM_MAX_WORKERS", "8"))
 _vllm_client = None
+
+# One resident checkpoint can be shared by several threads in robot_web_app.py (the live
+# loop, pushed /api/run frames, the /assistant page's grounding queries). generate() on a
+# single model isn't meant to be entered concurrently, so local generation is serialized.
+# (The vLLM path needs no lock -- the server does its own batching.)
+_GENERATE_LOCK = threading.Lock()
 
 
 def _get_vllm_client():
@@ -349,25 +357,61 @@ def describe_images(
         image_batch = prepared_images[start_idx:start_idx + batch_size]
         text_batch = [chat_template_text] * len(image_batch)
 
-        inputs = bundle.processor(
-            text=text_batch,
-            images=image_batch,
-            return_tensors="pt",
-            padding=True,
-        ).to(bundle.device)
+        with _GENERATE_LOCK:
+            inputs = bundle.processor(
+                text=text_batch,
+                images=image_batch,
+                return_tensors="pt",
+                padding=True,
+            ).to(bundle.device)
 
-        with torch.inference_mode():
-            out = bundle.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                use_cache=True,
-                generation_config=bundle.gen_cfg,
-            )
+            with torch.inference_mode():
+                out = bundle.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=True,
+                    generation_config=bundle.gen_cfg,
+                )
 
         generated_batch = bundle.processor.batch_decode(out, skip_special_tokens=True)
         labels.extend(_normalize_label(text) for text in generated_batch)
 
     return labels
+
+def generate_text(image, prompt, max_new_tokens=64, model_id=None, stopping_criteria=None):
+    """Raw, un-normalized reply for one image + prompt. For free-form output such as a
+    grounding answer ({"bbox_2d": [...]}) that describe_images()' single-word
+    _normalize_label() would mangle. Same backend routing as describe_images().
+    stopping_criteria: optional factory (tokenizer, prompt_len) -> StoppingCriteria, local
+    backend only."""
+    resolved_model_id = model_id or MODEL_ID
+    prepared = _prepare_image(image)
+    if _VLLM_BASE_URL and resolved_model_id == _VLLM_MODEL_ID:
+        return _describe_one_vllm(
+            _get_vllm_client(), resolved_model_id, prompt, _image_to_data_uri(prepared), max_new_tokens,
+        ).strip()
+
+    bundle = _get_bundle(model_id) if model_id else _default_bundle
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": prepared},
+        {"type": "text", "text": prompt},
+    ]}]
+    text = bundle.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    with _GENERATE_LOCK:
+        inputs = bundle.processor(text=[text], images=[prepared], return_tensors="pt", padding=True).to(bundle.device)
+        extra = {}
+        if stopping_criteria is not None:
+            extra["stopping_criteria"] = StoppingCriteriaList([
+                stopping_criteria(bundle.processor.tokenizer, inputs["input_ids"].shape[1]),
+            ])
+        with torch.inference_mode():
+            out = bundle.model.generate(
+                **inputs, max_new_tokens=max_new_tokens, use_cache=True, generation_config=bundle.gen_cfg,
+                **extra,
+            )
+    new_tokens = out[:, inputs["input_ids"].shape[1]:]
+    return bundle.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+
 
 def describe_image(
     img,
@@ -383,6 +427,171 @@ def describe_image(
         model_id=model_id,
     )
     return labels[0] if labels else "unknown"
+
+
+# --- Whole-image grounding (baseline: the VLM on its own, no detector) -----------
+# describe_images() above only ever sees one tight crop and names it. detect_objects()
+# instead hands the *whole* frame to the VLM and asks it to find every object itself,
+# boxes and all -- the "just use the VLM directly" baseline the robot demo page compares
+# the detector + OOD + VLM pipeline against (see robot_web_app.py /api/qwen-direct/*).
+GROUNDING_PROMPT = (
+    "Locate every object in the image. Report each one as "
+    '{"bbox_2d": [x1, y1, x2, y2], "label": "<short category name>"} '
+    "and output a JSON list only. Name each object as specifically as you can; "
+    'never use a generic word like "object" or "item" as a label.'
+)
+
+# Qwen3-VL emits grounding boxes in coordinates normalized to 0-1000 on both axes,
+# independent of the input resolution (Qwen2.5-VL used absolute pixels of its internally
+# resized image instead), so mapping back to the original frame is just a rescale.
+GROUNDING_COORD_SCALE = 1000.0
+
+# The whole frame is downscaled to at most this many pixels on its long side before it's
+# sent: the processor otherwise turns every 32x32 patch into a token, so a 3.5k-wide
+# screen recording became ~7k image tokens and one grounding call took ~2 min instead of
+# ~10 s. The boxes are relative (see above), so the resize never shifts them. 1280 leaves
+# a RealSense 1280x720 frame untouched.
+GROUNDING_MAX_SIDE = int(os.getenv("QWEN_GROUNDING_MAX_SIDE", "1280"))
+
+# Qwen sometimes repeats one object twice with (near-)identical boxes; a later box with
+# the same label overlapping a kept one by at least this IoU is dropped as a repeat.
+GROUNDING_DUP_IOU = 0.85
+
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", flags=re.MULTILINE)
+_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _grounding_items(text):
+    """Best-effort list of dicts out of a grounding reply. Tries the whole thing as JSON
+    first; failing that (most often: generation hit max_new_tokens mid-list, so the
+    closing bracket never arrived), salvages every complete {...} object individually."""
+    cleaned = _JSON_FENCE_RE.sub("", text.strip()).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        # Either one bare object, or a wrapper like {"objects": [...]}.
+        if "bbox_2d" in parsed or "bbox" in parsed:
+            parsed = [parsed]
+        else:
+            parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+
+    items = []
+    for match in _JSON_OBJECT_RE.finditer(cleaned):
+        try:
+            item = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def _parse_grounding(text, width, height):
+    detections = []
+    for item in _grounding_items(text):
+        bbox = item.get("bbox_2d", item.get("bbox"))
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(v) for v in bbox)
+        except (TypeError, ValueError):
+            continue
+        x1, x2 = sorted((x1 * width / GROUNDING_COORD_SCALE, x2 * width / GROUNDING_COORD_SCALE))
+        y1, y2 = sorted((y1 * height / GROUNDING_COORD_SCALE, y2 * height / GROUNDING_COORD_SCALE))
+        x1, x2 = max(0.0, min(width, x1)), max(0.0, min(width, x2))
+        y1, y2 = max(0.0, min(height, y1)), max(0.0, min(height, y2))
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            continue
+        label = str(item.get("label") or "object").strip().lower() or "object"
+        box = [round(x1), round(y1), round(x2), round(y2)]
+        if any(d["label"] == label and _box_iou(d["box"], box) >= GROUNDING_DUP_IOU for d in detections):
+            continue
+        detections.append({"label": label, "box": box})
+    return detections
+
+
+def _box_iou(a, b):
+    iw = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = iw * ih
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+# Greedy decoding on a busy scene sometimes falls into a loop, re-listing the same object(s)
+# over and over until max_new_tokens -- 1024 tokens is ~30 s on the 3090 instead of the usual
+# few seconds, and _parse_grounding() throws every one of those repeats away anyway. Once
+# this many complete items in a row only repeat earlier ones, generation is cut off there.
+GROUNDING_LOOP_REPEATS = 3
+
+
+class _GroundingLoopStop(StoppingCriteria):
+    """Stops a grounding reply once its last GROUNDING_LOOP_REPEATS complete {...} items are
+    all repeats (same label, IoU >= GROUNDING_DUP_IOU) of items listed before them. Only
+    re-decodes every few tokens, and only does any parsing once a new item has closed."""
+
+    def __init__(self, tokenizer, prompt_len, check_every=4):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+        self.check_every = check_every
+        self.items_seen = 0
+
+    def __call__(self, input_ids, scores, **kwargs):
+        stop = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        n_new = input_ids.shape[1] - self.prompt_len
+        if n_new <= 0 or n_new % self.check_every:
+            return stop
+        text = self.tokenizer.decode(input_ids[0, self.prompt_len:], skip_special_tokens=True)
+        items = _JSON_OBJECT_RE.findall(text)
+        if len(items) == self.items_seen or len(items) <= GROUNDING_LOOP_REPEATS:
+            return stop
+        self.items_seen = len(items)
+        # Coordinates stay in Qwen's 0-1000 space here: IoU doesn't care about the scale.
+        parsed = [d for d in (_grounding_item(item) for item in items) if d]
+        repeats = 0
+        for i in range(len(parsed) - 1, 0, -1):
+            label, box = parsed[i]
+            if not any(lab == label and _box_iou(b, box) >= GROUNDING_DUP_IOU for lab, b in parsed[:i]):
+                break
+            repeats += 1
+            if repeats >= GROUNDING_LOOP_REPEATS:
+                stop[:] = True
+                break
+        return stop
+
+
+def _grounding_item(item_text):
+    """(label, [x1, y1, x2, y2]) out of one {...} item's text, or None."""
+    try:
+        item = json.loads(item_text)
+        bbox = item.get("bbox_2d", item.get("bbox"))
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return str(item.get("label") or "").strip().lower(), [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+
+
+def detect_objects(image, prompt=GROUNDING_PROMPT, max_new_tokens=1024, model_id=None,
+                   max_side=GROUNDING_MAX_SIDE):
+    """Whole-image open-vocabulary detection with the VLM alone. Returns
+    (detections, raw_text): detections is a list of {"label", "box"} with box as
+    [x1, y1, x2, y2] in pixels of `image` (the downscale to max_side is undone);
+    raw_text is the model's unparsed reply. Backend routing (vLLM server vs. local
+    bundle) is generate_text()'s; on the local one a looping reply is cut short
+    (see GROUNDING_LOOP_REPEATS)."""
+    img = _prepare_image(image)
+    width, height = img.size
+    scale = max_side / max(width, height) if max_side else 1.0
+    if scale < 1.0:
+        img = img.resize((max(2, round(width * scale)), max(2, round(height * scale))), Image.BICUBIC)
+    raw = generate_text(img, prompt, max_new_tokens=max_new_tokens, model_id=model_id,
+                        stopping_criteria=_GroundingLoopStop)
+    return _parse_grounding(raw, width, height), raw
+
 
 if __name__ == "__main__":
     img_path = "/home/seher/Projects/object_detection/SAMOOD/OOD_object_name_generation/filtered/3661_329.jpg"

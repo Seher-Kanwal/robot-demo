@@ -1,0 +1,7 @@
+# Everything robot_client.py needs on the laptop riding on the robot (it only imports
+# frame_sources.py from this repo -- no torch/detectron2). Copy robot_client.py and
+# frame_sources.py over, then:  pip install -r requirements-laptop.txt
+opencv-python
+numpy
+requests
+pyrealsense2
