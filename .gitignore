@@ -7,3 +7,10 @@ __pycache__/
 .vscode/
 .history/
 *.log
+.pytest_cache/
+robot_code/hub/logs/
+robot_code/hub/cache/
+robot_code/hub/recordings/
+robot_code/teach_mode/teach_memory_backups/
+.venv/
+Samples/

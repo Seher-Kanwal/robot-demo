@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Demo Hub</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0d11;
+    --panel: #10151b;
+    --panel-2: #161c24;
+    --border: #232b35;
+    --border-soft: #1a2029;
+    --text: #e8ecf1;
+    --text-dim: #8994a3;
+    --text-faint: #566173;
+    --accent: #f5a623;
+    --ok: #3cbe3c;
+    --warn: #f2c94c;
+    --bad: #ff5a5f;
+    --info: #5b8cff;
+    /* the only four button colors: green = start, amber = restart/switch, red = stop, blue = open/show.
+       The quick-start buttons and card stripes use them per module: 1 green, 2 amber, 3 blue. */
+    --green: #3ddc84;
+    --amber: #ffb020;
+    --red: #ff5c5c;
+    --blue: #4da3ff;
+    --on-color: #0a0d11;
+    --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* class rules below set display, which would override the attribute */
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); padding: clamp(14px, 2.5vw, 32px); }
+  .page { max-width: 1400px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  header.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 24px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+  .kicker { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-family: var(--mono); font-size: clamp(20px, 2.4vw, 28px); margin: 4px 0 0; }
+  h2 { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin: 0 0 12px; }
+  .meters { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; font-size: 13px; color: var(--text-dim); }
+  .gpu { display: flex; align-items: center; gap: 8px; }
+  .bar { width: 140px; height: 8px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .4s; }
+  .pill { font-family: var(--mono); font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); white-space: nowrap; }
+  .pill[data-state="running"] { color: var(--ok); border-color: var(--ok); }
+  .pill[data-state="starting"] { color: var(--warn); border-color: var(--warn); }
+  .pill[data-state="crashed"] { color: var(--bad); border-color: var(--bad); }
+  .pill[data-state="busy"] { color: var(--info); border-color: var(--info); }
+
+  button { --c: var(--green); font: inherit; font-size: 14px; font-weight: 600; padding: 8px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--c); background: var(--c); color: var(--on-color); transition: filter .15s, background .15s; }
+  button:hover:not(:disabled) { filter: brightness(1.15); }
+  button.alt { --c: var(--amber); }
+  button.danger { --c: var(--red); }
+  button.info { --c: var(--blue); }
+  button.ghost { background: color-mix(in srgb, var(--c) 12%, transparent); color: var(--c); }
+  button.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--c) 24%, transparent); filter: none; }
+  button:disabled { opacity: .4; cursor: default; }
+
+  /* the two parts of the demo, each a row of scene buttons */
+  .part { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--c); border-radius: 12px;
+    padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+  .part-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px 24px; }
+  .part-kicker { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--c); }
+  .part-title { font-family: var(--sans); font-size: 20px; font-weight: 600; letter-spacing: 0; text-transform: none;
+    color: var(--text); margin: 2px 0 0; }
+  .part-sub { font-size: 13px; color: var(--text-dim); margin: 4px 0 0; max-width: 70ch; }
+  .scenes { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .preset .num { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .1em; color: var(--text-faint); }
+  /* fresh-demo memory controls (Part 1) */
+  .memory { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-dim); min-width: 0; max-width: 520px; }
+  .memory .row { gap: 6px 8px; }
+  .memory button { font-size: 12px; padding: 5px 10px; }
+  .memory select { max-width: 260px; }
+  #memSummary { color: var(--text); }
+  #memMsg { min-height: 1em; font-size: 12px; }
+  #memMsg.bad { color: var(--bad); }
+  /* everything that isn't part of the story: service cards, windows, tools */
+  details.advanced > summary { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--text-dim); padding: 10px 0; }
+  details.advanced[open] > summary { margin-bottom: 8px; }
+  .advanced-body { display: flex; flex-direction: column; gap: 18px; }
+  .preset { text-align: left; padding: 14px; border-radius: 12px; display: flex; flex-direction: column; gap: 4px;
+    background: color-mix(in srgb, var(--c) 14%, var(--panel)); color: var(--text); border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+    border-top: 4px solid var(--c); }
+  .preset:hover:not(:disabled) { background: color-mix(in srgb, var(--c) 26%, var(--panel)); filter: none; }
+  .preset b { font-size: 15px; color: var(--c); }
+  .preset span { font-size: 12px; font-weight: 400; color: var(--text-dim); }
+  .m1 { --c: var(--green); }
+  .m2 { --c: var(--amber); }
+  .m3 { --c: var(--blue); }
+  .preset.stop { --c: var(--red); }
+
+  /* service cards */
+  .services { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .card.m1, .card.m2, .card.m3 { border-top: 4px solid var(--c); }
+  .card.m1 .card-head strong, .card.m2 .card-head strong, .card.m3 .card-head strong { color: var(--c); }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .card-head strong { font-size: 16px; }
+  .detail { font-family: var(--mono); font-size: 12px; color: var(--text-faint); min-height: 1.2em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note { font-size: 12px; color: var(--text-dim); margin: 0; }
+  .opts { display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+  .opts label { display: inline-flex; align-items: center; gap: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+  select, input[type=text], input[type=number] { font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); min-width: 0; }
+  input[type=number] { width: 80px; }
+  select { max-width: 100%; }
+  details summary { cursor: pointer; font-size: 13px; color: var(--text-dim); }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+  .msg { font-size: 13px; color: var(--bad); min-height: 1em; }
+  pre.log { margin: 0; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px; font-size: 11px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
+
+  /* module windows */
+  .win-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  @media (max-width: 760px) { .win-row { grid-template-columns: 1fr; } }
+  .win-row button { text-align: left; padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 15px; }
+  .win-row button span { font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; opacity: .8; }
+
+  /* tools */
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; }
+  pre.console { margin: 0; min-height: 120px; max-height: 360px; overflow: auto; background: var(--bg); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div>
+      <div class="kicker">Robot demonstration</div>
+      <h1>Main page</h1>
+    </div>
+    <div class="meters">
+      <span class="gpu" title="GPU memory in use">GPU <span class="bar"><i id="gpuBar"></i></span> <span id="gpuText">–</span></span>
+      <span class="pill" id="cameraPill">RealSense: –</span>
+      <span class="pill" id="hubPill">connecting…</span>
+      <button type="button" class="danger" data-preset="stopAll" title="Stops all modules, frees the camera and GPU">Stop everything</button>
+    </div>
+  </header>
+
+  <!-- Part 1: Module 1, no VLM -->
+  <section class="part m1">
+    <div class="part-head">
+      <div>
+        <div class="part-kicker">Part 1 · OOD</div>
+        <h2 class="part-title">Ask &amp; Remember</h2>
+        <p class="part-sub">The energy-based OOD detector finds objects outside its training classes. The robot asks you what they are,
+          stores a few views of each, and recognizes them later. No VLM.</p>
+      </div>
+      <div class="memory">
+        <div>Robot memory: <span id="memSummary">–</span></div>
+        <div class="row">
+          <button type="button" class="danger ghost" id="memReset" title="Moves the memory into a backup folder and starts with an empty one">Fresh demo: back up &amp; clear</button>
+          <select id="memBackups" aria-label="Memory backups"><option value="">no backups yet</option></select>
+          <button type="button" class="alt ghost" id="memRestore" disabled>Restore</button>
+        </div>
+        <div id="memMsg"></div>
+      </div>
+    </div>
+    <div class="scenes">
+      <button type="button" class="preset m1" data-preset="teachLive" data-window="module1"><span class="num">1 · TEACH</span><b>Teach</b><span>The robot stops on an unknown object, asks its name, and you capture a few views.</span></button>
+      <button type="button" class="preset m1" data-preset="explore" data-window="module1"><span class="num">2 · REPLAY</span><b>Replay</b><span>Move the taught objects around: the robot recognizes them from memory and never asks.</span></button>
+      <button type="button" class="preset m1" data-preset="teachReplay" data-compare="ood"><span class="num">3 · SIDE BY SIDE</span><b>Teach &amp; Replay</b><span>Teaching on the left, recognition on the right, from the same camera: a new object is recognized right after it's taught.</span></button>
+    </div>
+  </section>
+
+  <!-- Part 2: Module 2 + Module 3, with the VLM -->
+  <section class="part m2">
+    <div class="part-head">
+      <div>
+        <div class="part-kicker">Part 2 · OED</div>
+        <h2 class="part-title">Open-ended naming with a VLM</h2>
+        <p class="part-sub">Our pipeline sends only the OOD objects to Qwen3-VL for a name. The baseline gives the whole image to Qwen3-VL alone.
+          Compare them on speed, objects found and names.</p>
+      </div>
+    </div>
+    <div class="scenes">
+      <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2"><span class="num">1 · OUR PIPELINE</span><b>OOD + VLM</b><span>Detector + energy OOD split; Qwen3-VL names only the unknown objects (asks you only if it can't).</span></button>
+      <button type="button" class="preset m3" data-preset="module3" data-window="module3"><span class="num">2 · BASELINE</span><b>VLM only</b><span>Qwen3-VL gets the whole camera image and finds and names every object by itself, no detector.</span></button>
+      <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2" data-path="?compare=1"><span class="num">3 · SIDE BY SIDE</span><b>OOD + VLM vs VLM</b><span>Both on the same live frames, with a results table (ms/frame, fps, objects, names) and a CSV for the report.</span></button>
+      <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2" data-path="assistant"><span class="num">4 · APPLICATION</span><b>Robot assistant</b><span>"Robot, where are my headphones?" The robot answers from what it has seen, with distance.</span></button>
+    </div>
+  </section>
+
+  <details class="advanced">
+  <summary>Advanced: services, thresholds, logs, tools</summary>
+  <div class="advanced-body">
+  <section class="services">
+    <!-- Module 1 -->
+    <div class="card m1" data-service="module1">
+      <div class="card-head"><strong>Module 1 · Ask &amp; Remember</strong><span class="pill" data-role="pill">–</span></div>
+      <div class="detail" data-role="detail"></div>
+      <p class="note">OOD detector → robot asks your name for it → capture views → recognizes it after it's moved. No VLM, ~2–3 GB GPU.</p>
+      <div class="opts">
+        <div class="row">
+          <label>start in <select id="m1mode"><option value="teach">Teach</option><option value="explore">Explore</option></select></label>
+          <button type="button" class="alt" id="m1modeNow" style="padding:4px 10px;font-size:12px" title="Switch the running Module 1 without restarting it">switch running →</button>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" id="m1record"> record session</label>
+          <label><input type="checkbox" id="m1scores"> show scores</label>
+          <label><input type="checkbox" id="m1known"> match VOC boxes</label>
+        </div>
+        <details>
+          <summary>Thresholds</summary>
+          <div class="row" style="margin-top:8px">
+            <label>recognize ≥ <input type="number" id="m1accept" value="0.62" step="0.01" min="0" max="1"></label>
+            <label title="Explore mode: an OOD box is only shown if the detector's score is at least this">explore OOD ≥ <input type="number" id="m1explore" value="0.95" step="0.01" min="0" max="1"></label>
+            <label>conf <input type="number" id="m1conf" value="0.9" step="0.05" min="0" max="1"></label>
+            <label>energy <input type="number" id="m1energy" value="-6.84" step="0.01"></label>
+          </div>
+        </details>
+      </div>
+      <div class="msg" data-role="msg"></div>
+      <div class="actions">
+        <button type="button" data-act="start">Start</button>
+        <button type="button" class="alt" data-act="restart">Restart</button>
+        <button type="button" class="danger" data-act="stop">Stop</button>
+        <button type="button" class="info" data-act="view">Open window ↗</button>
+        <button type="button" class="info ghost" data-act="log">Log</button>
+      </div>
+      <pre class="log" data-role="log" hidden></pre>
+    </div>
+
+    <!-- Module 2 -->
+    <div class="card m2" data-service="module2">
+      <div class="card-head"><strong>Module 2 · VLM naming</strong><span class="pill" data-role="pill">–</span></div>
+      <div class="detail" data-role="detail"></div>
+      <p class="note">OOD detector → Qwen3-VL-4B names it (8B second opinion) → asks you only if both fail. Loads Qwen locally: ~9 GB GPU, ~1 min to start.</p>
+      <div class="opts">
+        <div class="row">
+          <label><input type="checkbox" id="m2realsense" checked> RealSense live view</label>
+        </div>
+        <p class="note">Without the camera you can still run sample images and upload photos.</p>
+        <details>
+          <summary>Thresholds</summary>
+          <div class="row" style="margin-top:8px">
+            <label>conf <input type="number" id="m2conf" value="0.9" step="0.05" min="0" max="1"></label>
+            <label>energy <input type="number" id="m2energy" value="-6.84" step="0.01"></label>
+          </div>
+        </details>
+      </div>
+      <div class="msg" data-role="msg"></div>
+      <div class="actions">
+        <button type="button" data-act="start">Start</button>
+        <button type="button" class="alt" data-act="restart">Restart</button>
+        <button type="button" class="danger" data-act="stop">Stop</button>
+        <button type="button" class="info" data-act="view">Open window ↗</button>
+        <button type="button" class="info ghost" data-act="log">Log</button>
+      </div>
+      <pre class="log" data-role="log" hidden></pre>
+    </div>
+
+    <!-- Module 3 (runs inside the Module 2 server) -->
+    <div class="card m3" data-service="module3">
+      <div class="card-head"><strong>Module 3 · Qwen3-VL direct</strong><span class="pill" data-role="pill">–</span></div>
+      <div class="detail" data-role="detail"></div>
+      <p class="note">The whole camera image goes to Qwen3-VL, which locates and names every object by itself: no detector, no OOD split.
+        It runs inside Module 2's server (same Qwen weights, so no extra GPU memory). Module 2's pipeline pauses while it runs.
+        Each pass takes a few seconds.</p>
+      <p class="note">Start uses Module 2's threshold settings if it has to start the server.</p>
+      <div class="msg" data-role="msg"></div>
+      <div class="actions">
+        <button type="button" data-act="start">Start</button>
+        <button type="button" class="danger" data-act="stop">Stop</button>
+        <button type="button" class="info" data-act="view">Open window ↗</button>
+        <button type="button" class="info ghost" data-act="log">Log</button>
+      </div>
+      <pre class="log" data-role="log" hidden></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>Module windows</h2>
+    <div class="win-row">
+      <button type="button" class="m1" data-open="module1">Module 1 · Ask &amp; Remember ↗ <span data-win-state="module1">–</span></button>
+      <button type="button" class="m2" data-open="module2">Module 2 · VLM naming ↗ <span data-win-state="module2">–</span></button>
+      <button type="button" class="m3" data-open="module3">Module 3 · Qwen direct ↗ <span data-win-state="module3">–</span></button>
+    </div>
+    <p class="note" style="margin-top:8px">Every module opens in a window of its own (pressing again reuses that window). If Chrome blocks it, allow pop-ups for this page.</p>
+  </section>
+
+  <section class="card">
+    <h2>Tools</h2>
+    <div class="tools" id="tools"></div>
+    <div class="row" style="justify-content:space-between">
+      <span class="detail" id="jobStatus">no tool run yet</span>
+      <button type="button" class="danger" id="jobStop" disabled>Stop tool</button>
+    </div>
+    <pre class="console" id="console"></pre>
+  </section>
+  </div>
+  </details>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const cards = {};
+  document.querySelectorAll('.card[data-service]').forEach(function (c) { cards[c.dataset.service] = c; });
+  const part = (name, role) => cards[name].querySelector('[data-role="' + role + '"]');
+  let last = null;           // latest /api/status payload
+
+  async function api(url, body) {
+    const res = await fetch(url, body === undefined ? undefined
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json().catch(function () { return {}; });
+    return { ok: res.ok, status: res.status, data: data };
+  }
+
+  // ---------------------------------------------------------------- options from the cards
+  function options(name) {
+    if (name === 'module1') {
+      return {
+        record: $('m1record').checked,
+        show_scores: $('m1scores').checked, match_known_boxes: $('m1known').checked, mode: $('m1mode').value,
+        accept_thres: $('m1accept').value, conf_thres: $('m1conf').value, energy_thres: $('m1energy').value,
+        explore_ood_conf: $('m1explore').value,
+      };
+    }
+    if (name === 'module2') {
+      return { realsense: $('m2realsense').checked, conf_thres: $('m2conf').value, energy_thres: $('m2energy').value };
+    }
+    if (name === 'module3') {  // runs inside the Module 2 server: these are used if that server has to start
+      return { conf_thres: $('m2conf').value, energy_thres: $('m2energy').value };
+    }
+    return {};
+  }
+
+  function setMsg(name, text) { part(name, 'msg').textContent = text || ''; }
+
+  // ---------------------------------------------------------------- start / stop
+  async function start(name, opts, quiet) {
+    setMsg(name, '');
+    let r = await api('/api/service/' + name + '/start', { options: opts });
+    if (r.status === 409 && r.data.restart) {  // Module 3: Module 2 runs without the camera
+      if (!confirm(r.data.error)) return false;
+      setMsg(name, 'restarting Module 2 with the RealSense…');
+      r = await api('/api/service/' + name + '/start', { options: opts, restart: true });
+    }
+    if (r.status === 409 && r.data.conflict) {
+      if (!confirm(r.data.error)) return false;
+      setMsg(name, 'stopping the camera user…');
+      r = await api('/api/service/' + name + '/start', { options: opts, force: true, restart: true });
+    }
+    if (!r.ok) {
+      if (!(quiet && /already running/.test(r.data.error || ''))) setMsg(name, r.data.error || ('HTTP ' + r.status));
+      return false;
+    }
+    setMsg(name, '');
+    refresh();
+    return true;
+  }
+  async function stop(name) {
+    setMsg(name, 'stopping…');
+    await api('/api/service/' + name + '/stop', {});
+    setMsg(name, '');
+    refresh();
+  }
+  async function restart(name) {
+    await stop(name);
+    return start(name, options(name));
+  }
+  function canon(o) {  // key order independent (the server sends keys sorted)
+    return JSON.stringify(Object.keys(o).sort().map(function (k) { return [k, String(o[k])]; }));
+  }
+  function sameOptions(name, opts) {
+    const cur = last && last.services[name];
+    return cur && (cur.state === 'running' || cur.state === 'starting') && cur.options &&
+      canon(cur.options) === canon(opts);
+  }
+  async function ensure(name, opts) {
+    // presets: leave a service alone if it already runs with these options, else (re)start it
+    if (sameOptions(name, opts)) return true;
+    const cur = last && last.services[name];
+    if (cur && cur.state !== 'stopped' && cur.state !== 'crashed') await stop(name);
+    return start(name, opts);
+  }
+
+  // Teach <-> Explore on a Module 1 that's already live on the camera: just flip its mode
+  // (keeps the session -- no reload of the detector/embedder, no lost questions history).
+  async function switchModule1Mode(mode) {
+    const r = await api('/api/module1/mode', { mode: mode });
+    if (!r.ok) { setMsg('module1', r.data.error || ('HTTP ' + r.status)); return false; }
+    setMsg('module1', '');
+    $('m1mode').value = mode;
+    return true;
+  }
+  function module1LiveOnCamera() {
+    const s = last && last.services.module1;
+    return s && s.state === 'running' && s.camera;
+  }
+  async function module1Live(mode) {
+    if (module1LiveOnCamera()) {
+      return switchModule1Mode(mode);
+    }
+    return ensure('module1', Object.assign(options('module1'), { mode: mode }));
+  }
+  $('m1modeNow').addEventListener('click', function () { switchModule1Mode($('m1mode').value); });
+
+  const presets = {
+    teachLive: function () { return module1Live('teach'); },
+    explore: function () { return module1Live('explore'); },
+    module3: async function () {
+      const cur = last && last.services.module3;
+      return (cur && cur.state === 'running') || start('module3', options('module3'));
+    },
+    // Part 1 scene 3: Module 1 with a second, explore-mode view of the same frames (/recognize)
+    teachReplay: function () {
+      return ensure('module1', Object.assign(options('module1'), { mode: 'teach', dual_view: true }));
+    },
+    vlmLive: async function () {
+      const m3 = last && last.services.module3;
+      if (m3 && m3.state !== 'stopped' && m3.state !== 'crashed') await stop('module3');  // un-pause the pipeline
+      return ensure('module2', Object.assign(options('module2'), { realsense: true }));
+    },
+    stopAll: async function () {
+      for (const name of ['module3', 'module1', 'module2']) {
+        const cur = last && last.services[name];
+        if (cur && cur.state !== 'stopped') await stop(name);
+      }
+    },
+  };
+  document.querySelectorAll('[data-preset]').forEach(function (b) {
+    b.addEventListener('click', async function () {
+      // /compare follows its modules' start-up itself, so it needs no wins[] entry
+      const compare = b.dataset.compare;
+      const win = compare ? null : b.dataset.window;
+      // now, inside the click -- after an await it'd be a blocked pop-up
+      if (compare) window.open('/compare?set=' + compare, 'robot-demo-compare-' + compare);
+      else if (win) openWindow(win, true, b.dataset.path);
+      document.querySelectorAll('[data-preset]').forEach(function (x) { x.disabled = true; });
+      try { const ok = await presets[b.dataset.preset](); if (win) windowStarted(win, ok); } finally {
+        document.querySelectorAll('[data-preset]').forEach(function (x) { x.disabled = false; });
+      }
+    });
+  });
+
+  Object.keys(cards).forEach(function (name) {
+    cards[name].querySelectorAll('[data-act]').forEach(function (b) {
+      b.addEventListener('click', async function () {
+        const act = b.dataset.act;
+        if (act === 'log') { const log = part(name, 'log'); log.hidden = !log.hidden; renderLogs(); return; }
+        if (act === 'view') { openWindow(name, false); return; }
+        const win = act === 'start' || act === 'restart';
+        if (win) openWindow(name, true);
+        b.disabled = true;
+        try {
+          if (act === 'start') { const ok = await start(name, options(name)); if (win) windowStarted(name, ok); }
+          else if (act === 'stop') await stop(name);
+          else if (act === 'restart') { const ok = await restart(name); if (win) windowStarted(name, ok); }
+        } finally { b.disabled = false; }
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------- status rendering
+  function ago(ts) {
+    if (!ts) return '';
+    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
+  }
+
+  function render(d) {
+    last = d;
+    $('hubPill').dataset.state = 'running';
+    $('hubPill').textContent = 'hub connected';
+    if (d.gpu) {
+      const pct = 100 * d.gpu.used_mb / d.gpu.total_mb;
+      $('gpuBar').style.width = pct.toFixed(0) + '%';
+      $('gpuBar').style.background = pct > 90 ? 'var(--bad)' : pct > 70 ? 'var(--warn)' : 'var(--ok)';
+      $('gpuText').textContent = (d.gpu.used_mb / 1024).toFixed(1) + ' / ' + (d.gpu.total_mb / 1024).toFixed(0) + ' GB';
+    }
+    $('cameraPill').textContent = 'RealSense: ' + (d.camera_owner || 'free');
+    $('cameraPill').dataset.state = d.camera_owner ? 'busy' : '';
+
+    Object.keys(cards).forEach(function (name) {
+      const s = d.services[name];
+      const pill = part(name, 'pill');
+      pill.dataset.state = s.state;
+      pill.textContent = s.state + (s.state === 'running' || s.state === 'starting' ? ' · ' + ago(s.started) : '');
+      let detail = '';
+      if (s.state === 'starting' || s.state === 'crashed') detail = s.log.length ? s.log[s.log.length - 1] : '';
+      else if (s.state === 'running') detail = (s.camera ? 'using the RealSense · ' : '') + (s.external ? 'started outside the hub' : 'pid ' + s.pids.join(', '));
+      if (s.instances > 1) detail = s.instances + ' copies running! ' + detail;
+      part(name, 'detail').textContent = detail;
+      part(name, 'detail').title = detail;
+      cards[name].querySelector('[data-act=start]').disabled = s.state === 'running' || s.state === 'starting';
+      cards[name].querySelector('[data-act=stop]').disabled = s.state === 'stopped';
+      const open = part(name, 'open');
+      if (open) open.setAttribute('aria-disabled', s.state === 'running' ? 'false' : 'true');
+    });
+    document.querySelectorAll('[data-win-state]').forEach(function (el) {
+      const s = d.services[el.dataset.winState];
+      el.textContent = s ? s.state : '–';
+    });
+    renderLogs();
+    renderWindows();
+    renderTools(d);
+  }
+
+  function renderLogs() {
+    if (!last) return;
+    Object.keys(cards).forEach(function (name) {
+      const log = part(name, 'log');
+      if (log.hidden) return;
+      const s = last.services[name];
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.textContent = s.log.length ? s.log.join('\n') : (s.external ? '(started outside the hub — its output is in that terminal)' : '(no output yet)');
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    });
+  }
+
+  async function refresh() {
+    try {
+      const r = await api('/api/status');
+      render(r.data);
+    } catch (e) {
+      $('hubPill').dataset.state = 'crashed';
+      $('hubPill').textContent = 'hub unreachable';
+    }
+  }
+
+  // ---------------------------------------------------------------- module windows
+  // Every button that shows a module opens its page in a window of its own, one per module
+  // (pressing again reuses it). The browser only allows that synchronously inside the click,
+  // so a module that still has to start first gets a "starting…" note in its window, which
+  // moves on to the module's page once the module is up.
+  // `path` (optional) is a page of the module relative to its URL, e.g. "assistant" or "?compare=1".
+  const wins = {};  // name -> { w, ready, path }  windows waiting for their module
+  function openWindow(name, starting, path) {
+    const s = last && last.services[name];
+    const target = 'robot-demo-' + name;
+    path = path || '';
+    if (!starting && !(s && (s.state === 'running' || s.state === 'starting'))) {
+      setMsg(name, (s ? s.title : name) + ' is not running -- press Start');
+      return;
+    }
+    if (!starting && s.state === 'running') { delete wins[name]; window.open(s.url + path, target); return; }
+    const w = window.open('about:blank', target);
+    if (!w) { setMsg(name, 'the browser blocked the new window -- allow pop-ups for this page'); return; }
+    wins[name] = { w: w, ready: !starting, path: path };
+    note(w, (s ? s.title : name) + ' is starting…');
+    if (!starting) renderWindows();
+  }
+  function windowStarted(name, ok) {  // the start/restart behind openWindow(name, true) has returned
+    const e = wins[name];
+    if (!e) return;
+    if (ok) { e.ready = true; renderWindows(); return; }
+    note(e.w, 'Not started -- see the message on the main page.');
+    delete wins[name];
+  }
+  function note(w, text) {
+    try {
+      const doc = w.document;
+      if (!doc.getElementById('hubNote')) {
+        doc.open();
+        doc.write('<!doctype html><meta charset="utf-8"><title>Robot demo</title><body style="margin:0;height:100vh;display:flex;' +
+          'align-items:center;justify-content:center;background:#0a0d11;color:#e8ecf1;font:18px Segoe UI,sans-serif">' +
+          '<p id="hubNote"></p></body>');
+        doc.close();
+      }
+      doc.getElementById('hubNote').textContent = text;
+    } catch (e) { /* the window still shows the module's old page (other origin) -- next refresh */ }
+  }
+  function renderWindows() {
+    if (!last) return;
+    Object.keys(wins).forEach(function (name) {
+      const e = wins[name], s = last.services[name];
+      if (e.w.closed) { delete wins[name]; return; }
+      if (e.ready && s.state === 'running') { e.w.location.href = s.url + e.path; delete wins[name]; }
+      else if (e.ready && s.state === 'crashed') { note(e.w, s.title + ' stopped with an error -- open its Log on the main page.'); delete wins[name]; }
+      else note(e.w, s.title + ' is starting…' + (s.state === 'starting' ? ' (loading models' + (name === 'module1' ? '' : ', about a minute') + ')' : ''));
+    });
+  }
+  document.querySelectorAll('[data-open]').forEach(function (b) {
+    b.addEventListener('click', function () { openWindow(b.dataset.open, false); });
+  });
+
+  // ---------------------------------------------------------------- tools
+  let toolsBuilt = false, jobSince = 0, jobPolling = false;
+  function renderTools(d) {
+    if (!toolsBuilt) {
+      toolsBuilt = true;
+      Object.keys(d.tools).forEach(function (key) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'info ghost'; b.textContent = d.tools[key];
+        b.addEventListener('click', async function () {
+          const r = await api('/api/tool/' + key, {});
+          if (!r.ok) { $('jobStatus').textContent = r.data.error; return; }
+          $('console').textContent = ''; jobSince = 0;
+          pollJob();
+        });
+        $('tools').appendChild(b);
+      });
+    }
+    const j = d.job;
+    $('jobStop').disabled = !j.running;
+    if (j.name) $('jobStatus').textContent = j.title + (j.running ? ' — running…' : ' — finished (exit ' + j.exit_code + ')');
+    if (j.running && !jobPolling) pollJob();
+  }
+  async function pollJob() {
+    if (jobPolling) return;
+    jobPolling = true;
+    try {
+      for (;;) {
+        const r = await api('/api/tool/output?since=' + jobSince);
+        if (r.data.lines.length) {
+          const c = $('console');
+          c.textContent += (c.textContent ? '\n' : '') + r.data.lines.join('\n');
+          c.scrollTop = c.scrollHeight;
+          jobSince = r.data.total;
+        }
+        if (!r.data.running) break;
+        await new Promise(function (ok) { setTimeout(ok, 600); });
+      }
+    } finally { jobPolling = false; refresh(); }
+  }
+  $('jobStop').addEventListener('click', function () { api('/api/tool/stop', {}); });
+
+  // ---------------------------------------------------------------- fresh demo (Module 1 memory)
+  function memMsg(text, bad) {
+    $('memMsg').textContent = text || '';
+    $('memMsg').className = bad ? 'bad' : '';
+  }
+  let memObjects = [];
+  async function loadMemory() {
+    const r = await api('/api/module1/memory/backups').catch(function () { return null; });
+    if (!r || !r.ok) {  // e.g. Module 1 still starting: keep what's shown
+      if (r && r.data.error) memMsg(r.data.error, true);
+      return;
+    }
+    if ($('memMsg').className === 'bad') memMsg('');
+    memObjects = r.data.objects || [];
+    $('memSummary').textContent = memObjects.length
+      ? memObjects.length + ' object' + (memObjects.length === 1 ? '' : 's') + ' (' + memObjects.join(', ') + ')'
+      : 'empty';
+    const sel = $('memBackups'), keep = sel.value;
+    sel.textContent = '';
+    (r.data.backups.length ? r.data.backups : [null]).forEach(function (b) {
+      const o = document.createElement('option');
+      o.value = b ? b.name : '';
+      o.textContent = b ? b.name.replace(/^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)/, '$1-$2-$3 $4:$5:$6') +
+        ' · ' + b.objects.length + ' object' + (b.objects.length === 1 ? '' : 's') : 'no backups yet';
+      if (b) o.title = b.objects.join(', ');
+      sel.appendChild(o);
+    });
+    if (keep && Array.prototype.some.call(sel.options, function (o) { return o.value === keep; })) sel.value = keep;
+    $('memRestore').disabled = !r.data.backups.length;
+  }
+  $('memReset').addEventListener('click', async function () {
+    if (!memObjects.length) { memMsg('The memory is already empty.'); return; }
+    if (!confirm('Back up the robot\'s memory (' + memObjects.join(', ') + ') and start with an empty memory?')) return;
+    const r = await api('/api/module1/memory/reset', {});
+    memMsg(r.ok ? 'Backed up as ' + r.data.backup + '. The memory is empty now.' : (r.data.error || 'HTTP ' + r.status), !r.ok);
+    loadMemory();
+  });
+  $('memRestore').addEventListener('click', async function () {
+    const name = $('memBackups').value;
+    if (!name) return;
+    const cur = memObjects.length ? ' The current memory (' + memObjects.join(', ') + ') is backed up first.' : '';
+    if (!confirm('Restore the memory from ' + name + '?' + cur)) return;
+    const r = await api('/api/module1/memory/restore', { name: name });
+    memMsg(r.ok ? 'Restored ' + name + (r.data.backup ? '; the previous memory is backup ' + r.data.backup : '') + '.'
+      : (r.data.error || 'HTTP ' + r.status), !r.ok);
+    loadMemory();
+  });
+
+  // ---------------------------------------------------------------- init
+  (async function init() {
+    await refresh();
+    setInterval(refresh, 1500);
+    loadMemory();
+    setInterval(loadMemory, 5000);  // the robot learns new objects while teaching
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ask &amp; Remember</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0d11;
+    --panel: #10151b;
+    --panel-2: #161c24;
+    --border: #232b35;
+    --border-soft: #1a2029;
+    --text: #e8ecf1;
+    --text-dim: #8994a3;
+    --text-faint: #566173;
+    --accent: #f5a623;
+    --known: #5b8cff;
+    --ood: #ff5a5f;
+    --memory: #3cbe3c;
+    --ask: #ffd200;
+    --capture: #aa50dc;
+    --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #eef1f4;
+      --panel: #ffffff;
+      --panel-2: #f4f6f8;
+      --border: #d6dce2;
+      --border-soft: #e2e7ec;
+      --text: #171b20;
+      --text-dim: #565f6b;
+      --text-faint: #8b95a1;
+      --accent: #c97a06;
+      --known: #2f5fd9;
+      --ood: #d6333c;
+      --memory: #1f8f2a;
+      --ask: #a88200;
+      --capture: #8a2fbf;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* class rules below set display, which would override the attribute */
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: var(--sans); padding: clamp(16px, 3vw, 36px);
+    display: flex; justify-content: center; -webkit-font-smoothing: antialiased;
+  }
+  .page { width: 100%; max-width: 1320px; display: flex; flex-direction: column; gap: 18px; }
+  header.top {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 24px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border-soft);
+  }
+  .kicker { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-family: var(--mono); font-size: clamp(20px, 2.4vw, 28px); margin: 4px 0 0; }
+  h2 { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin: 0 0 12px; }
+  .toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 14px; color: var(--text-dim); }
+  .toggles label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-dim);
+  }
+  .pill[data-mode="live"] { color: var(--memory); border-color: var(--memory); }
+  .pill[data-mode="error"] { color: var(--ood); border-color: var(--ood); }
+  .mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .mode-switch button { border: 0; border-radius: 0; background: transparent; color: var(--text-dim); padding: 6px 14px; font-size: 13px; }
+  .mode-switch button[aria-pressed="true"] { background: var(--accent); color: #111; }
+  .banner { border: 1px solid var(--memory); border-radius: 10px; padding: 10px 14px; font-size: 14px;
+    background: color-mix(in srgb, var(--memory) 10%, var(--panel)); }
+  body.explore #oodView, body.explore #askCard { display: none; }
+  body.explore .views { grid-template-columns: 1fr; }
+  body.explore .grid { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 1000px) { body.explore .grid { grid-template-columns: 1fr; } }
+
+  /* ---- 7-step tracker ---- */
+  ol.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+  ol.steps li {
+    border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; background: var(--panel);
+    font-size: 13px; color: var(--text-faint); transition: all .25s; min-width: 0;
+  }
+  ol.steps li b { font-family: var(--mono); display: block; font-size: 16px; }
+  ol.steps li.on { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel)); transform: translateY(-2px); }
+  @media (max-width: 760px) { ol.steps { grid-template-columns: repeat(4, 1fr); } }
+
+  /* ---- live views ---- */
+  .views { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .views { grid-template-columns: 1fr; } }
+  .view { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .view .bar { display: flex; justify-content: space-between; padding: 8px 12px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border-soft); }
+  .view .frame { aspect-ratio: 16 / 9; background: #000; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 14px; }
+  .view img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+
+  /* ---- cards ---- */
+  .grid { display: grid; grid-template-columns: 1.3fr 1fr 0.8fr; gap: 14px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+  .card.hot { border-color: var(--ask); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ask) 22%, transparent); }
+  .muted { color: var(--text-dim); font-size: 14px; }
+  .ask-body { display: grid; grid-template-columns: 160px 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 520px) { .ask-body { grid-template-columns: 1fr; } }
+  .ask-body img { width: 160px; max-height: 180px; object-fit: contain; background: var(--panel-2); border-radius: 8px; border: 2px solid var(--ask); }
+  .question { font-size: 18px; font-weight: 600; margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text] {
+    flex: 1; min-width: 140px; font: inherit; font-size: 16px; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  }
+  input[type=text].interim { font-style: italic; color: var(--text-dim); }
+  button {
+    font: inherit; font-size: 14px; font-weight: 600; padding: 9px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: #111;
+  }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.mic { width: 44px; padding: 9px 0; background: transparent; border-color: var(--border); color: var(--text); }
+  button.mic.on { border-color: var(--ood); color: var(--ood); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ood) 25%, transparent); } }
+  .small { font-size: 12px; color: var(--text-faint); margin-top: 8px; min-height: 1em; }
+  .bubble {
+    position: relative; background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px;
+    padding: 12px 14px; font-size: 16px; min-height: 48px;
+  }
+  .voice-log { margin: 10px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--text-dim); max-height: 150px; overflow: auto; }
+  .voice-log li { padding: 3px 0; border-top: 1px solid var(--border-soft); }
+  .voice-log time { font-family: var(--mono); font-size: 11px; color: var(--text-faint); margin-right: 6px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { border-radius: 999px; padding: 4px 10px; font-size: 13px; border: 1px solid var(--memory); color: var(--memory); }
+  .tag b { font-family: var(--mono); font-weight: 500; font-size: 11px; margin-left: 4px; }
+
+  /* ---- memory gallery ---- */
+  .mem-objects { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .mem-obj { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--panel-2); }
+  .mem-obj.fresh { animation: fresh 1.6s ease-out; }
+  @keyframes fresh { from { border-color: var(--memory); box-shadow: 0 0 0 4px color-mix(in srgb, var(--memory) 30%, transparent); } }
+  .mem-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .mem-head strong { font-size: 16px; overflow-wrap: anywhere; }
+  .mem-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(56px, 1fr)); gap: 4px; }
+  .mem-thumbs img { width: 100%; aspect-ratio: 1; object-fit: contain; background: var(--bg); border-radius: 4px; }
+  .mem-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .mem-actions button { padding: 5px 10px; font-size: 12px; }
+
+  /* ---- capture window ---- */
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal[hidden] { display: none; }
+  .modal-box {
+    width: min(1100px, 100%); max-height: 100%; overflow: auto; background: var(--panel); border: 2px solid var(--capture);
+    border-radius: 14px; padding: 16px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px;
+  }
+  @media (max-width: 860px) { .modal-box { grid-template-columns: 1fr; } }
+  .cap-preview { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16 / 9; }
+  .cap-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  .flash.go { animation: flash .35s ease-out; }
+  @keyframes flash { from { opacity: .8; } to { opacity: 0; } }
+  .cap-guide { font-size: 20px; font-weight: 700; margin: 4px 0; }
+  .cap-status { font-family: var(--mono); font-size: 13px; }
+  .cap-status.ok { color: var(--memory); }
+  .cap-status.miss { color: var(--ask); }
+  .cap-status.warn { color: var(--text-dim); }
+  button.shoot { width: 100%; font-size: 20px; padding: 16px; background: var(--capture); border-color: var(--capture); color: #fff; margin: 10px 0; }
+  .cap-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(74px, 1fr)); gap: 6px; }
+  .thumb { position: relative; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--bg); }
+  .thumb img { width: 100%; aspect-ratio: 1; object-fit: contain; display: block; }
+  .thumb .n { position: absolute; left: 3px; top: 2px; font-family: var(--mono); font-size: 10px; color: #fff; text-shadow: 0 0 3px #000; }
+  .thumb .x { position: absolute; right: 2px; top: 2px; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 4px; background: rgba(0,0,0,.6); border: 0; color: #fff; }
+  .thumb .badges { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; text-align: center; background: color-mix(in srgb, var(--ask) 85%, #000); color: #111; }
+  .thumb.saved { border-color: var(--memory); }
+  .cap-foot { display: flex; gap: 8px; margin-top: 12px; }
+  .cap-foot button { flex: 1; }
+  kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+
+  /* ---- start gate (browsers only allow voice/mic after a click) ---- */
+  .gate { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .gate[hidden] { display: none; }
+  .gate-card { max-width: 460px; text-align: center; }
+  .gate-card p { color: var(--text-dim); }
+  .gate-card button { font-size: 18px; padding: 14px 28px; }
+</style>
+</head>
+<body>
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <div class="kicker">Module 1 · Ask &amp; Remember</div>
+    <h1>Teach the robot</h1>
+    <p>The robot asks about objects it doesn't recognize, learns them from a few views, and finds them again later.
+       Click start to turn on its voice and microphone.</p>
+    <button id="startBtn" type="button">Start</button>
+  </div>
+</div>
+
+<div class="page">
+  <header class="top">
+    <div>
+      <div class="kicker">Module 1 · Ask &amp; Remember</div>
+      <h1>Teach the robot</h1>
+    </div>
+    <div class="toggles">
+      <span class="mode-switch" role="group" aria-label="Mode">
+        <button type="button" id="modeTeach" aria-pressed="true" title="Ask about unknown objects and learn them">Teach</button>
+        <button type="button" id="modeExplore" aria-pressed="false" title="Look around: show only what the robot knows, never ask">Explore</button>
+      </span>
+      <span class="pill" id="statusPill" data-mode="wait">connecting…</span>
+      <label><input type="checkbox" id="voiceToggle" checked> Voice</label>
+      <select id="voiceSelect" aria-label="Robot voice" title="Robot voice"></select>
+      <button type="button" class="secondary" id="voiceTest" style="padding:5px 10px;font-size:13px">Test voice</button>
+      <label><input type="checkbox" id="handsFreeToggle" checked> Hands-free mic</label>
+      <label><input type="checkbox" id="autoSubmitToggle" checked> Auto-submit speech</label>
+    </div>
+  </header>
+
+  <ol class="steps" id="steps">
+    <li data-step="1"><b>1</b>Current camera image</li>
+    <li data-step="2"><b>2</b>Run OOD detector</li>
+    <li data-step="3"><b>3</b>Ask the user</li>
+    <li data-step="4"><b>4</b>Collect multiple views</li>
+    <li data-step="5"><b>5</b>Update memory</li>
+    <li data-step="6"><b>6</b>Move the object</li>
+    <li data-step="7"><b>7</b>Recognize from memory</li>
+  </ol>
+
+  <div class="banner" id="exploreBanner" hidden>
+    <b>Explore mode</b> — showing known (VOC) objects and objects recognized from memory.
+    Unknown objects are hidden, and an OOD box is only shown when the detector's score is ≥ <b id="exploreConf">0.95</b>.
+    The robot won't ask questions; switch back to <b>Teach</b> to teach something new.
+  </div>
+
+  <section class="views">
+    <div class="view" id="oodView">
+      <div class="bar"><span>OOD detector</span>
+        <span class="legend"><span><i class="sw" style="background:var(--known)"></i>VOC class</span><span><i class="sw" style="background:var(--ood)"></i>Unknown (OOD)</span></span>
+      </div>
+      <div class="frame"><img id="oodImg" alt="Detector output: VOC classes in blue, unknown objects in red" hidden><span id="oodWait">waiting for the camera…</span></div>
+    </div>
+    <div class="view">
+      <div class="bar"><span id="robotTitle">Robot view</span>
+        <span class="legend"><span><i class="sw" style="background:var(--memory)"></i>memory</span><span><i class="sw" style="background:var(--ask)"></i>asking</span><span><i class="sw" style="background:var(--capture)"></i>capturing</span><span><i class="sw" style="background:var(--ood)"></i>unknown</span></span>
+      </div>
+      <div class="frame"><img id="robotImg" alt="Robot view: recognized objects in green, the object being asked about in yellow" hidden><span id="robotWait">waiting for the camera…</span></div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card" id="askCard">
+      <h2>3 · Ask the user</h2>
+      <div id="askIdle" class="muted">Watching for unfamiliar objects…</div>
+      <div id="askActive" hidden>
+        <div class="kicker" id="askCount" style="margin-bottom:8px"></div>
+        <div class="ask-body">
+          <img id="askCrop" alt="The unfamiliar object">
+          <div>
+            <p class="question">What is this called?</p>
+            <form class="row" id="askForm" autocomplete="off">
+              <button type="button" class="mic" id="micBtn" title="Speak the name">🎤</button>
+              <input type="text" id="askInput" placeholder="say or type its name">
+              <button type="submit" id="askSubmit">Teach</button>
+            </form>
+            <div class="row" style="margin-top:8px">
+              <button type="button" class="secondary" id="askSkip" title="Don't learn this one; it won't be asked about again">Skip</button>
+              <button type="button" class="secondary" id="askSkipRest" title="Skip every object left on this image and go live again">Skip the rest</button>
+              <span class="muted" id="askMeta"></span>
+            </div>
+            <div class="small" id="speechStatus"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Robot says</h2>
+      <div class="bubble" id="bubble">…</div>
+      <ul class="voice-log" id="voiceLog"></ul>
+    </div>
+
+    <div class="card">
+      <h2>7 · Recognized from memory</h2>
+      <div class="pills" id="recPills"><span class="muted">nothing yet</span></div>
+      <h2 style="margin-top:16px">Known (VOC) in view</h2>
+      <div class="muted" id="knownList">–</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>5 · Memory: name + multi-view features</h2>
+    <div class="muted" id="memMeta"></div>
+    <div class="mem-objects" id="memObjects"></div>
+  </section>
+</div>
+
+<div class="modal" id="capModal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="capTitle">
+    <div>
+      <div class="kicker">4 · Collect multiple views</div>
+      <h1 id="capTitle" style="margin-bottom:10px">…</h1>
+      <div class="cap-preview">
+        <img id="capPreview" alt="Live camera preview; the purple box is what Capture will save">
+        <div class="flash" id="capFlash"></div>
+      </div>
+    </div>
+    <div>
+      <div class="cap-guide" id="capGuide">View 1: show the front</div>
+      <div class="cap-status" id="capStatus"></div>
+      <button type="button" class="shoot" id="capShoot">📸 Capture</button>
+      <div class="small" id="capHint">Press <kbd>Space</kbd> or say “capture”. <kbd>Enter</kbd> = done, <kbd>Esc</kbd> = cancel.</div>
+      <h2 style="margin-top:14px">Views (<span id="capCount">0</span>)</h2>
+      <div class="cap-thumbs" id="capThumbs"></div>
+      <div class="cap-foot">
+        <button type="button" class="secondary" id="capCancel">Cancel</button>
+        <button type="button" id="capDone">Done — save to memory</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    gate: $('gate'), startBtn: $('startBtn'), statusPill: $('statusPill'),
+    voice: $('voiceToggle'), handsFree: $('handsFreeToggle'), autoSubmit: $('autoSubmitToggle'),
+    steps: $('steps'), oodImg: $('oodImg'), robotImg: $('robotImg'), oodWait: $('oodWait'), robotWait: $('robotWait'),
+    askCard: $('askCard'), askIdle: $('askIdle'), askActive: $('askActive'), askCrop: $('askCrop'), askForm: $('askForm'),
+    askInput: $('askInput'), askSubmit: $('askSubmit'), askSkip: $('askSkip'), askMeta: $('askMeta'),
+    micBtn: $('micBtn'), speechStatus: $('speechStatus'), bubble: $('bubble'), voiceLog: $('voiceLog'),
+    recPills: $('recPills'), knownList: $('knownList'), memMeta: $('memMeta'), memObjects: $('memObjects'),
+    capModal: $('capModal'), capTitle: $('capTitle'), capPreview: $('capPreview'), capFlash: $('capFlash'),
+    capGuide: $('capGuide'), capStatus: $('capStatus'), capShoot: $('capShoot'), capHint: $('capHint'),
+    capThumbs: $('capThumbs'), capCount: $('capCount'), capCancel: $('capCancel'), capDone: $('capDone'),
+  };
+
+  // ---------------------------------------------------------------- settings (per browser)
+  function loadToggle(box, key) {
+    try { const v = localStorage.getItem('teach_' + key); if (v !== null) box.checked = v === '1'; } catch (e) { /* private window */ }
+    box.addEventListener('change', function () {
+      try { localStorage.setItem('teach_' + key, box.checked ? '1' : '0'); } catch (e) { /* ignore */ }
+    });
+  }
+  loadToggle(el.voice, 'voice'); loadToggle(el.handsFree, 'handsfree'); loadToggle(el.autoSubmit, 'autosubmit');
+
+  async function post(url, body) {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  // ---------------------------------------------------------------- robot voice (TTS)
+  // The browser speaks through Windows' *default* output device. Voices come from the
+  // OS (local) or Google (online, needs internet); the picker shows which is which, and
+  // any error is written into the log instead of failing silently.
+  const synth = window.speechSynthesis || null;
+  const voiceSelect = $('voiceSelect');
+  let voices = [];
+  const speaking = new Set();  // Chrome drops an utterance's events if it gets garbage-collected mid-speech
+
+  function logLine(text, isError) {
+    const li = document.createElement('li');
+    const t = document.createElement('time');
+    t.textContent = new Date().toLocaleTimeString();
+    li.appendChild(t); li.appendChild(document.createTextNode(text));
+    if (isError) li.style.color = 'var(--ood)';
+    el.voiceLog.prepend(li);
+    while (el.voiceLog.children.length > 12) el.voiceLog.lastChild.remove();
+  }
+
+  function loadVoices() {
+    voices = synth ? synth.getVoices() : [];
+    const rank = function (v) { return (/^en/i.test(v.lang) ? 0 : 2) + (v.localService ? 0 : 1); };
+    voices.sort(function (a, b) { return rank(a) - rank(b) || a.name.localeCompare(b.name); });
+    let saved = null;
+    try { saved = localStorage.getItem('teach_voice_uri'); } catch (e) { /* private window */ }
+    voiceSelect.innerHTML = '';
+    voices.forEach(function (v) {
+      const o = document.createElement('option');
+      o.value = v.voiceURI;
+      o.textContent = v.name + ' (' + v.lang + ')' + (v.localService ? '' : ' · online');
+      voiceSelect.appendChild(o);
+    });
+    if (!voices.length) {
+      const o = document.createElement('option'); o.textContent = synth ? 'loading voices…' : 'no speech in this browser';
+      voiceSelect.appendChild(o);
+    } else if (saved && voices.some(function (v) { return v.voiceURI === saved; })) {
+      voiceSelect.value = saved;
+    }  // else: the first entry, i.e. the best English voice available
+  }
+  if (synth) { loadVoices(); synth.addEventListener('voiceschanged', loadVoices); }
+  voiceSelect.addEventListener('change', function () {
+    try { localStorage.setItem('teach_voice_uri', voiceSelect.value); } catch (e) { /* ignore */ }
+  });
+
+  function say(text, onend) {
+    el.bubble.textContent = text;
+    logLine(text);
+    if (!el.voice.checked || !synth) { if (onend) setTimeout(onend, 50); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    const v = voices.find(function (x) { return x.voiceURI === voiceSelect.value; });
+    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
+    let done = false;
+    const finish = function () { if (done) return; done = true; speaking.delete(u); if (onend) onend(); };
+    u.onend = finish;
+    u.onerror = function (ev) {
+      if (ev.error !== 'interrupted' && ev.error !== 'canceled') {
+        logLine('voice error: ' + ev.error + (v && !v.localService ? ' (online voice — needs internet; try a local one)' : ''), true);
+      }
+      finish();
+    };
+    speaking.add(u);
+    if (synth.paused) synth.resume();  // Chrome sometimes leaves the queue paused
+    synth.speak(u);  // queued, so back-to-back lines don't cut each other off
+  }
+  $('voiceTest').addEventListener('click', function () {
+    if (!el.voice.checked) { el.voice.checked = true; el.voice.dispatchEvent(new Event('change')); }
+    if (synth) synth.cancel();  // clear anything stuck in the queue
+    say('Testing. I am the robot. Can you hear me?');
+  });
+
+  let audioCtx = null;
+  function shutter() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain(), t0 = audioCtx.currentTime;
+      o.frequency.value = 1400; g.gain.setValueAtTime(0.25, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.09);
+      o.connect(g).connect(audioCtx.destination); o.start(t0); o.stop(t0 + 0.1);
+    } catch (e) { /* no audio -- the flash still shows */ }
+  }
+
+  // ---------------------------------------------------------------- user voice (STT)
+  // Chrome/Edge only. One recognizer at a time: 'name' (one answer, then stop) or
+  // 'command' (keeps listening for "capture"/"done" while the capture window is open).
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  let rec = null, recMode = null;
+  if (!SR) {
+    el.micBtn.hidden = true;
+    el.speechStatus.textContent = 'Speech input needs Chrome or Edge — type the name instead.';
+  }
+  function stopListening() {
+    if (rec) { const r = rec; rec = null; recMode = null; try { r.abort(); } catch (e) { /* already stopped */ } }
+    el.micBtn.classList.remove('on');
+  }
+  function listenForName() {
+    if (!SR || !current.asking) return;
+    stopListening();
+    const r = new SR();
+    r.lang = 'en-US'; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
+    r.onresult = function (ev) {
+      let interim = '', final = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        if (ev.results[i].isFinal) final += ev.results[i][0].transcript; else interim += ev.results[i][0].transcript;
+      }
+      if (final) {
+        el.askInput.value = final.trim(); el.askInput.classList.remove('interim');
+        el.speechStatus.textContent = 'heard: “' + final.trim() + '”';
+        if (el.autoSubmit.checked) submitAnswer();
+      } else {
+        el.askInput.value = interim; el.askInput.classList.add('interim');
+      }
+    };
+    r.onerror = function (ev) { el.speechStatus.textContent = 'mic: ' + ev.error + (ev.error === 'network' ? ' (speech recognition needs internet)' : ''); };
+    r.onend = function () { if (rec === r) { rec = null; recMode = null; el.micBtn.classList.remove('on'); } };
+    rec = r; recMode = 'name';
+    try { r.start(); el.micBtn.classList.add('on'); el.speechStatus.textContent = 'listening…'; } catch (e) { rec = null; }
+  }
+  function listenForCommands() {
+    if (!SR || !el.handsFree.checked || !captureOpen) return;
+    if (recMode === 'command') return;
+    stopListening();
+    const r = new SR();
+    r.lang = 'en-US'; r.interimResults = false; r.continuous = true;
+    r.onresult = function (ev) {
+      if (synth && synth.speaking) return;  // don't react to the robot's own voice
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        if (!ev.results[i].isFinal) continue;
+        const said = ev.results[i][0].transcript.toLowerCase();
+        if (/\b(done|finish(ed)?|that'?s (all|it))\b/.test(said)) { finishCapture(); return; }
+        if (/\b(capture|take|snap|shoot|cheese|picture|photo)\b/.test(said)) shoot();
+      }
+    };
+    r.onend = function () {
+      if (rec !== r) return;
+      rec = null; recMode = null;
+      if (captureOpen && el.handsFree.checked) setTimeout(listenForCommands, 250);  // Chrome stops after silence
+    };
+    rec = r; recMode = 'command';
+    try { r.start(); } catch (e) { rec = null; recMode = null; }
+  }
+  el.micBtn.addEventListener('click', function () { if (recMode === 'name') stopListening(); else listenForName(); });
+  el.askInput.addEventListener('input', function () { el.askInput.classList.remove('interim'); });
+
+  // ---------------------------------------------------------------- polling
+  const current = { asking: null, since: null, memVersion: -1, capSig: '' };
+  let captureOpen = false;
+
+  async function poll() {
+    try {
+      const res = await fetch('/api/state' + (current.since === null ? '' : '?since=' + current.since));
+      const data = await res.json();
+      render(data);
+    } catch (e) {
+      el.statusPill.dataset.mode = 'error';
+      el.statusPill.textContent = 'server unreachable';
+    } finally {
+      setTimeout(poll, 400);
+    }
+  }
+
+  function render(d) {
+    if (d.error) { el.statusPill.dataset.mode = 'error'; el.statusPill.textContent = 'camera error: ' + d.error; }
+    else if (d.frozen && !d.capture) {
+      el.statusPill.dataset.mode = 'wait';
+      el.statusPill.textContent = 'PAUSED · ' + (d.frozen.named + d.frozen.skipped) + '/' + d.frozen.total + ' named';
+    }
+    else if (d.ready) { el.statusPill.dataset.mode = 'live'; el.statusPill.textContent = 'LIVE · ' + d.fps + ' fps'; }
+    else { el.statusPill.dataset.mode = 'wait'; el.statusPill.textContent = 'starting camera…'; }
+    if (d.ready) {
+      el.oodImg.hidden = el.robotImg.hidden = false;
+      el.oodWait.hidden = el.robotWait.hidden = true;
+    }
+
+    renderMode(d);
+    Array.prototype.forEach.call(el.steps.children, function (li) {
+      li.classList.toggle('on', Number(li.dataset.step) === d.current_step);
+    });
+
+    // Only speak events that happen after the page was opened, not the server's backlog.
+    if (current.since === null) current.since = d.last_seq;
+    else (d.events || []).forEach(function (ev) {
+      current.since = Math.max(current.since, ev.seq);
+      handleEvent(ev);
+    });
+
+    renderAsk(d.asking, d.queue_len, d.capture, d.frozen);
+    renderCapture(d.capture);
+    if (d.mode !== 'explore') {
+      $('robotTitle').textContent = d.frozen && !d.capture ? 'Robot view · paused on this image' : 'Robot view';
+    }
+
+    el.recPills.innerHTML = '';
+    if (!d.recognized.length) el.recPills.innerHTML = '<span class="muted">nothing in view</span>';
+    d.recognized.forEach(function (r) {
+      const s = document.createElement('span');
+      s.className = 'tag';
+      s.textContent = r.name;
+      const b = document.createElement('b'); b.textContent = r.score.toFixed(2); s.appendChild(b);
+      el.recPills.appendChild(s);
+    });
+    el.knownList.textContent = d.known_labels.length ? d.known_labels.join(', ') : '–';
+
+    if (d.memory_version !== current.memVersion) { current.memVersion = d.memory_version; loadMemory(); }
+  }
+
+  function handleEvent(ev) {
+    if (ev.type === 'ask') {
+      say(ev.text, function () { if (el.handsFree.checked && current.asking && !captureOpen) listenForName(); });
+    } else {
+      say(ev.text);
+    }
+  }
+
+  // ---------------------------------------------------------------- teach / explore mode
+  function renderMode(d) {
+    const explore = d.mode === 'explore';
+    document.body.classList.toggle('explore', explore);
+    $('modeTeach').setAttribute('aria-pressed', explore ? 'false' : 'true');
+    $('modeExplore').setAttribute('aria-pressed', explore ? 'true' : 'false');
+    $('exploreBanner').hidden = !explore;
+    $('exploreConf').textContent = d.explore_ood_conf;
+    $('robotTitle').textContent = explore ? 'Robot view · explore' : 'Robot view';
+    if (explore && recMode === 'name') stopListening();
+  }
+  async function setMode(mode) {
+    try {
+      await post('/api/mode', { mode: mode });
+    } catch (e) {
+      logLine('could not switch mode: ' + e.message, true);
+    }
+  }
+  $('modeTeach').addEventListener('click', function () { setMode('teach'); });
+  $('modeExplore').addEventListener('click', function () { setMode('explore'); });
+
+  // ---------------------------------------------------------------- step 3: ask
+  function renderAsk(asking, queueLen, capture, frozen) {
+    const prev = current.asking;
+    current.asking = asking ? asking.item_id : null;
+    el.askActive.hidden = !asking;
+    el.askIdle.hidden = !!asking;
+    el.askCard.classList.toggle('hot', !!asking);
+    el.askIdle.textContent = capture
+      ? (frozen ? 'Capturing views — then the next object you named on that image.' : 'Capturing views…')
+      : 'Watching for unfamiliar objects… When I find some, I stop on that image and ask about each one.';
+    if (asking) $('askCount').textContent = 'Object ' + asking.index + ' of ' + asking.total + ' on this image';
+    if (!asking) { if (prev !== null && recMode === 'name') stopListening(); return; }
+    if (asking.item_id !== prev) {
+      el.askInput.value = ''; el.askInput.classList.remove('interim');
+      el.speechStatus.textContent = SR ? '' : el.speechStatus.textContent;
+      if (!captureOpen) el.askInput.focus({ preventScroll: true });
+    }
+    if (el.askCrop.getAttribute('src') !== asking.crop) el.askCrop.src = asking.crop;
+    el.askMeta.textContent = queueLen ? queueLen + ' more after this one' : 'last one on this image';
+    $('askSkipRest').hidden = !queueLen;
+  }
+
+  async function submitAnswer() {
+    const name = el.askInput.value.trim();
+    if (!name || current.asking === null) return;
+    stopListening();
+    el.askSubmit.disabled = true;
+    try {
+      await post('/api/answer', { item_id: current.asking, name: name });
+      el.speechStatus.textContent = '';
+    } catch (e) {
+      el.speechStatus.textContent = e.message;
+    } finally {
+      el.askSubmit.disabled = false;
+    }
+  }
+  el.askForm.addEventListener('submit', function (ev) { ev.preventDefault(); submitAnswer(); });
+  el.askSkip.addEventListener('click', async function () {
+    if (current.asking === null) return;
+    stopListening();
+    try { await post('/api/skip', { item_id: current.asking }); } catch (e) { el.speechStatus.textContent = e.message; }
+  });
+  $('askSkipRest').addEventListener('click', async function () {
+    stopListening();
+    try { await post('/api/skip_rest'); } catch (e) { el.speechStatus.textContent = e.message; }
+  });
+
+  // ---------------------------------------------------------------- step 4: capture window
+  // capture_session.CaptureSession.level(): how the object being taught compares with its views so far
+  const CAP_LEVELS = {
+    dup: { cls: 'warn', text: 'same as a view you have, turn it' },
+    match: { cls: 'ok', text: 'matches ✓' },
+    'new': { cls: 'ok', text: 'new angle ✓, good to capture' },
+  };
+
+  function renderCapture(cap) {
+    if (cap && !captureOpen) {
+      captureOpen = true;
+      el.capModal.hidden = false;
+      el.capPreview.src = '/stream/robot.mjpg?t=' + Date.now();
+      setHint();
+      stopListening();
+      setTimeout(listenForCommands, 1200);  // after the robot's "Thanks! Please show me..." line starts
+    } else if (!cap && captureOpen) {
+      captureOpen = false;
+      el.capModal.hidden = true;
+      el.capPreview.removeAttribute('src');  // closes the extra MJPEG connection
+      if (recMode === 'command') stopListening();
+      current.capSig = '';
+      return;
+    }
+    if (!cap) return;
+    el.capTitle.textContent = cap.name;
+    el.capGuide.textContent = cap.guide_text;
+    const lv = cap.target_found ? CAP_LEVELS[cap.target_level] : null;
+    el.capStatus.className = 'cap-status ' + (lv ? lv.cls : 'miss');
+    el.capStatus.textContent = !cap.target_found
+      ? 'no ' + cap.name + ' in view — show it near the +, turning it a little at a time'
+      : cap.target_score === null ? 'object on the + ✓'
+      : 'similarity to ' + cap.name + ': ' + cap.target_score.toFixed(2) + ' — ' + lv.text;
+    const sig = JSON.stringify([cap.seed_views, cap.views.map(function (v) { return v.idx; })]);
+    if (sig !== current.capSig) { current.capSig = sig; renderThumbs(cap); }
+  }
+
+  function setHint() {
+    el.capHint.innerHTML = 'Press <kbd>Space</kbd>' + (SR && el.handsFree.checked ? ' or say “capture”' : '') +
+      '. <kbd>Enter</kbd> = done, <kbd>Esc</kbd> = cancel.';
+  }
+
+  function renderThumbs(cap) {
+    el.capThumbs.innerHTML = '';
+    cap.seed_views.forEach(function (url) {
+      const t = document.createElement('div');
+      t.className = 'thumb saved';
+      t.innerHTML = '<img alt="saved view"><span class="n">saved</span>';
+      t.querySelector('img').src = url;
+      el.capThumbs.appendChild(t);
+    });
+    cap.views.forEach(function (v) {
+      const t = document.createElement('div');
+      t.className = 'thumb';
+      t.innerHTML = '<img alt="captured view"><span class="n"></span><button type="button" class="x" title="Delete this view">✕</button>';
+      t.querySelector('img').src = v.thumb;
+      t.querySelector('.n').textContent = '#' + v.idx +
+        (v.sim === null ? '' : ' · ' + v.sim.toFixed(2));
+      if (v.badges.length) {
+        const b = document.createElement('div'); b.className = 'badges'; b.textContent = v.badges.join(' · ');
+        t.appendChild(b);
+      }
+      t.querySelector('.x').addEventListener('click', async function () {
+        try { await post('/api/capture/delete', { idx: v.idx }); } catch (e) { el.capStatus.textContent = e.message; }
+      });
+      el.capThumbs.appendChild(t);
+    });
+    el.capCount.textContent = cap.seed_views.length + cap.views.length;
+  }
+
+  let shooting = false;
+  async function shoot() {
+    if (!captureOpen || shooting) return;
+    shooting = true; el.capShoot.disabled = true;
+    try {
+      await post('/api/capture/shoot');
+      shutter();
+      el.capFlash.classList.remove('go'); void el.capFlash.offsetWidth; el.capFlash.classList.add('go');
+    } catch (e) {
+      el.capStatus.textContent = e.message;
+    } finally {
+      shooting = false; el.capShoot.disabled = false;
+    }
+  }
+  async function finishCapture() {
+    if (!captureOpen) return;
+    el.capDone.disabled = true;
+    try { await post('/api/capture/done'); } catch (e) { el.capStatus.textContent = e.message; }
+    finally { el.capDone.disabled = false; }
+  }
+  async function cancelCapture() {
+    if (!captureOpen) return;
+    if (!confirm('Discard the views captured in this window? (The first view from naming stays saved.)')) return;
+    try { await post('/api/capture/cancel'); } catch (e) { el.capStatus.textContent = e.message; }
+  }
+  el.capShoot.addEventListener('click', shoot);
+  el.capDone.addEventListener('click', finishCapture);
+  el.capCancel.addEventListener('click', cancelCapture);
+  el.handsFree.addEventListener('change', function () {
+    setHint();
+    if (el.handsFree.checked) listenForCommands(); else if (recMode === 'command') stopListening();
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (!captureOpen) return;
+    if (ev.key === ' ' || ev.code === 'Space') { ev.preventDefault(); shoot(); }
+    else if (ev.key === 'Enter') { ev.preventDefault(); finishCapture(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancelCapture(); }
+  });
+
+  // ---------------------------------------------------------------- step 5: memory gallery
+  let knownObjectIds = null;
+  async function loadMemory() {
+    let data;
+    try { data = await (await fetch('/api/memory')).json(); } catch (e) { return; }
+    el.memMeta.textContent = data.objects.length
+      ? data.objects.length + ' object(s) · embedder ' + data.embedder + ' · match threshold ' + data.accept_thres
+      : 'Empty — answer one of the robot\'s questions to teach it something.';
+    const prevIds = knownObjectIds;
+    knownObjectIds = new Set(data.objects.map(function (o) { return o.id + ':' + o.n_views; }));
+    el.memObjects.innerHTML = '';
+    data.objects.forEach(function (o) {
+      const card = document.createElement('div');
+      card.className = 'mem-obj' + (prevIds && !prevIds.has(o.id + ':' + o.n_views) ? ' fresh' : '');
+      card.innerHTML = '<div class="mem-head"><strong></strong><span class="muted"></span></div>' +
+        '<div class="mem-thumbs"></div>' +
+        '<div class="mem-actions"><button type="button" class="secondary" data-a="add">Add views</button>' +
+        '<button type="button" class="secondary" data-a="rename">Rename</button>' +
+        '<button type="button" class="secondary" data-a="delete">Delete</button></div>';
+      card.querySelector('strong').textContent = o.name;
+      card.querySelector('.muted').textContent = o.n_views + ' view' + (o.n_views === 1 ? '' : 's');
+      const thumbs = card.querySelector('.mem-thumbs');
+      o.views.forEach(function (v) {
+        const img = document.createElement('img');
+        img.loading = 'lazy'; img.alt = o.name + ' view'; img.src = '/memory/' + v.file;
+        thumbs.appendChild(img);
+      });
+      card.querySelector('[data-a=add]').addEventListener('click', function () {
+        post('/api/capture/start', { object_id: o.id }).catch(function (e) { alert(e.message); });
+      });
+      card.querySelector('[data-a=rename]').addEventListener('click', function () {
+        const name = prompt('New name for "' + o.name + '":', o.name);
+        if (name && name.trim()) post('/api/memory/rename', { object_id: o.id, name: name }).catch(function (e) { alert(e.message); });
+      });
+      card.querySelector('[data-a=delete]').addEventListener('click', function () {
+        if (confirm('Forget "' + o.name + '" and all ' + o.n_views + ' of its views?')) {
+          post('/api/memory/delete', { object_id: o.id }).catch(function (e) { alert(e.message); });
+        }
+      });
+      el.memObjects.appendChild(card);
+    });
+  }
+
+  // ---------------------------------------------------------------- start
+  el.startBtn.addEventListener('click', function () {
+    el.gate.hidden = true;
+    el.oodImg.src = '/stream/ood.mjpg';
+    el.robotImg.src = '/stream/robot.mjpg';
+    say('Hello! Show me some objects. I will ask about anything I do not recognize.');
+    poll();
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replay · Recognize</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0d11;
+    --panel: #10151b;
+    --border: #232b35;
+    --text: #e8ecf1;
+    --text-dim: #8994a3;
+    --text-faint: #566173;
+    --known: #5b8cff;
+    --memory: #3cbe3c;
+    --ood: #ff5a5f;
+    --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #eef1f4;
+      --panel: #ffffff;
+      --border: #d6dce2;
+      --text: #171b20;
+      --text-dim: #565f6b;
+      --text-faint: #8b95a1;
+      --known: #2f5fd9;
+      --memory: #22862a;
+      --ood: #d6333c;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans);
+    display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+  h1 { font-family: var(--mono); font-size: 16px; margin: 0; }
+  .pill { font-family: var(--mono); font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); }
+  .pill.live { color: var(--memory); border-color: var(--memory); }
+  .pill.bad { color: var(--ood); border-color: var(--ood); }
+  .frame { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000;
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden; color: var(--text-dim); }
+  .frame img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 14px; }
+  .row > b { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); min-width: 92px; }
+  .chip { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--memory); color: var(--memory); font-weight: 600; }
+  .muted { color: var(--text-dim); }
+  #say { min-height: 1.4em; font-size: 18px; color: var(--memory); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Replay · recognize from memory</h1>
+    <span class="pill" id="status">connecting…</span>
+  </header>
+  <div class="frame"><img id="img" alt="Recognize view: objects named from memory in green, VOC objects in blue" hidden><span id="wait">waiting for the camera…</span></div>
+  <div id="say" aria-live="polite"></div>
+  <div class="row"><b>Recognized</b><span id="rec"><span class="muted">–</span></span></div>
+  <div class="row"><b>VOC objects</b><span id="known" class="muted">–</span></div>
+<script>
+  // The explore side of teach_app.py --dual-view: the same camera frames and memory as the
+  // teach page next to it, so an object shows up here as soon as it has been taught. Captions
+  // only, no voice -- the teach side does the talking.
+  const $ = function (id) { return document.getElementById(id); };
+  let since = 0, first = true, streaming = false, sayTimer = null;
+
+  function say(text) {
+    $('say').textContent = text;
+    clearTimeout(sayTimer);
+    sayTimer = setTimeout(function () { $('say').textContent = ''; }, 6000);
+  }
+
+  function render(d) {
+    const status = $('status');
+    status.className = 'pill' + (d.error ? ' bad' : d.ready ? ' live' : '');
+    status.textContent = d.error ? 'camera error: ' + d.error : d.ready ? 'LIVE · ' + d.fps + ' fps' : 'starting camera…';
+    if (d.ready && !streaming) {
+      streaming = true;
+      $('img').src = '/stream/recognize.mjpg';
+      $('img').hidden = false;
+      $('wait').hidden = true;
+    }
+    const rec = $('rec');
+    rec.textContent = '';
+    if (!d.recognized.length) rec.innerHTML = '<span class="muted">nothing from memory in view</span>';
+    d.recognized.forEach(function (r) {
+      const c = document.createElement('span');
+      c.className = 'chip';
+      c.textContent = r.name + ' ' + r.score.toFixed(2);
+      rec.appendChild(c);
+      rec.appendChild(document.createTextNode(' '));
+    });
+    $('known').textContent = d.known_labels.length ? d.known_labels.join(', ') : '–';
+    if (!first) d.events.forEach(function (e) { if (e.type !== 'mode') say(e.text); });  // skip the backlog on first load
+    first = false;
+    since = d.last_seq;
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch('/api/recognize/state?since=' + since, { cache: 'no-store' });
+      const d = await r.json();
+      if (!r.ok) { $('status').className = 'pill bad'; $('status').textContent = d.error || ('HTTP ' + r.status); }
+      else render(d);
+    } catch (e) {
+      $('status').className = 'pill bad';
+      $('status').textContent = 'Module 1 not reachable';
+    }
+    setTimeout(poll, 700);
+  }
+  poll();
+</script>
+</body>
+</html>
