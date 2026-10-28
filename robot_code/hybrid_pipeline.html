@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OOD + Memory + OED</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0d11;
+    --panel: #10151b;
+    --panel-2: #161c24;
+    --border: #232b35;
+    --border-soft: #1a2029;
+    --text: #e8ecf1;
+    --text-dim: #8994a3;
+    --text-faint: #566173;
+    /* the box colors robot_implementation draws with: known / OOD / memory / VLM */
+    --known: #4d7dff;
+    --ood: #ff5a5f;
+    --memory: #b478e0;
+    --vlm: #f5a623;
+    --ok: #3cbe3c;
+    --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #eef1f4;
+      --panel: #ffffff;
+      --panel-2: #f4f6f8;
+      --border: #d6dce2;
+      --border-soft: #e2e7ec;
+      --text: #171b20;
+      --text-dim: #565f6b;
+      --text-faint: #8b95a1;
+      --known: #2f5fe0;
+      --ood: #d6333c;
+      --memory: #8a4fc0;
+      --vlm: #c97a06;
+      --ok: #1f8a3a;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); padding: clamp(14px, 2.5vw, 32px); }
+  .page { max-width: 1480px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  header.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 24px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+  .kicker { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--memory); }
+  h1 { font-family: var(--mono); font-size: clamp(20px, 2.4vw, 28px); margin: 4px 0 0; }
+  h2 { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin: 0; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pill { font-family: var(--mono); font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); white-space: nowrap; }
+  .pill[data-mode="on"] { color: var(--ok); border-color: var(--ok); }
+  .pill[data-mode="warn"] { color: var(--vlm); border-color: var(--vlm); }
+  .pill[data-mode="error"] { color: var(--ood); border-color: var(--ood); }
+  button { font: inherit; font-size: 14px; font-weight: 600; padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--memory); background: var(--memory); color: #0a0d11; }
+  button.ghost { background: transparent; color: var(--text-dim); border-color: var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  .intro { color: var(--text-dim); font-size: 14px; margin: 0; max-width: 980px; line-height: 1.5; }
+  .intro b { color: var(--text); font-weight: 600; }
+  .err { color: var(--ood); font-size: 14px; min-height: 1em; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
+  .muted { color: var(--text-dim); font-size: 13px; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* ---- the method, as a flow with this frame's numbers */
+  .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 28px; position: relative; }
+  .node { position: relative; background: var(--panel-2); border: 1px solid var(--border); border-top: 3px solid var(--c, var(--border));
+    border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .node:not(:last-child)::after { content: ""; position: absolute; right: -22px; top: 50%; width: 16px; height: 2px; background: var(--text-faint); }
+  .node:not(:last-child)::before { content: ""; position: absolute; right: -23px; top: calc(50% - 4px); border: 5px solid transparent;
+    border-left: 6px solid var(--text-faint); border-right: 0; }
+  .node .step { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--c, var(--text-dim)); }
+  .node .what { font-size: 13px; color: var(--text-dim); }
+  .node .big { font-family: var(--mono); font-size: 20px; font-weight: 600; color: var(--text); }
+  .node .big small { font-size: 12px; font-weight: 400; color: var(--text-dim); }
+  .node .ms { font-family: var(--mono); font-size: 12px; color: var(--text-faint); }
+  .n-cam { --c: var(--text-dim); }
+  .n-ood { --c: var(--ood); }
+  .n-mem { --c: var(--memory); }
+  .n-vlm { --c: var(--vlm); }
+  .n-out { --c: var(--ok); }
+  .split { display: flex; gap: 6px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; }
+  .split span { border-radius: 999px; padding: 1px 8px; border: 1px solid currentColor; }
+  @media (max-width: 1000px) {
+    .flow { grid-template-columns: 1fr; gap: 18px; }
+    .node:not(:last-child)::after { right: auto; left: 24px; top: auto; bottom: -14px; width: 2px; height: 10px; }
+    .node:not(:last-child)::before { right: auto; left: 20px; top: auto; bottom: -19px; border: 5px solid transparent; border-top: 6px solid var(--text-faint); border-bottom: 0; }
+  }
+  /* per-frame time, split by step */
+  .timebar { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+  .timebar .bar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--panel-2); border: 1px solid var(--border-soft); }
+  .timebar .bar i { display: block; height: 100%; transition: width .3s; }
+  .timebar .keys { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--text-dim); }
+  .timebar .keys b { font-family: var(--mono); font-weight: 600; color: var(--text); }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+  /* ---- the two screens */
+  .screens { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  @media (max-width: 900px) { .screens { grid-template-columns: minmax(0, 1fr); } }
+  .screen { border-top: 4px solid var(--c); display: flex; flex-direction: column; gap: 10px; }
+  .screen-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .screen-head h2 { color: var(--c); }
+  .screen p { margin: 0; font-size: 13px; color: var(--text-dim); }
+  .frame { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; color: #8994a3; font-size: 14px; text-align: center; }
+  .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .frame .ph { padding: 20px; }
+  .s-ood { --c: var(--ood); }
+  .s-all { --c: var(--memory); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--text-dim); }
+
+  /* ---- the three steps */
+  .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  @media (max-width: 1100px) { .steps { grid-template-columns: 1fr; } }
+  .stepcard { border-top: 4px solid var(--c); display: flex; flex-direction: column; gap: 10px; }
+  .stepcard .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .stepcard .head h2 { color: var(--c); }
+  .stepcard .head .sub { font-size: 13px; color: var(--text-dim); margin-top: 4px; }
+  .stepcard .metric { font-family: var(--mono); font-size: 22px; font-weight: 600; text-align: right; white-space: nowrap; }
+  .stepcard .metric small { display: block; font-size: 11px; font-weight: 400; color: var(--text-dim); }
+  dl.kv { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin: 0; font-size: 13px; }
+  dl.kv dt { color: var(--text-dim); }
+  dl.kv dd { margin: 0; font-family: var(--mono); text-align: right; }
+  .rows { display: flex; flex-direction: column; gap: 6px; }
+  .row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: center; padding: 6px;
+    border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border-soft); }
+  .thumbs { display: flex; align-items: center; gap: 4px; }
+  .thumb { width: 56px; height: 56px; border-radius: 6px; object-fit: contain; background: #000; display: block; }
+  .thumbs .eq { font-family: var(--mono); font-size: 12px; color: var(--text-faint); }
+  .row .t { display: flex; flex-direction: column; gap: 3px; min-width: 0; font-size: 13px; }
+  .row .t .l1 { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+  .row .t .id { font-family: var(--mono); font-weight: 600; color: var(--text-dim); }
+  .row .t .name { font-weight: 600; overflow-wrap: anywhere; }
+  .row .t .why { color: var(--text-dim); font-size: 12px; }
+  .tag { font-family: var(--mono); font-size: 11px; border-radius: 999px; padding: 1px 8px; border: 1px solid currentColor; white-space: nowrap; }
+  .c-ood { color: var(--ood); }
+  .c-mem { color: var(--memory); }
+  .c-vlm { color: var(--vlm); }
+  .c-faint { color: var(--text-faint); }
+  /* similarity vs the match threshold */
+  .sim { position: relative; height: 6px; border-radius: 3px; background: var(--border); margin-top: 2px; }
+  .sim i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--c, var(--text-faint)); }
+  .sim b { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+  .empty { font-size: 13px; color: var(--text-dim); padding: 6px 2px; }
+
+  /* ---- session + memory */
+  .bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 14px; }
+  @media (max-width: 1000px) { .bottom { grid-template-columns: 1fr; } }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-top: 10px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px; }
+  .tile .v { font-family: var(--mono); font-size: 20px; font-weight: 600; }
+  .tile .k { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; margin-top: 10px; }
+  .mem { background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px; text-align: center; min-width: 0; }
+  .mem.hit { border-color: var(--memory); box-shadow: 0 0 0 1px var(--memory) inset; }
+  .mem img { width: 100%; aspect-ratio: 1; object-fit: contain; background: #000; border-radius: 6px; display: block; }
+  .mem .nm { font-size: 12px; font-weight: 600; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mem .vw { font-size: 11px; color: var(--text-dim); }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div>
+      <div class="kicker">Part 3 · OOD + Memory + OED</div>
+      <h1>Memory first, the VLM only for what's new</h1>
+    </div>
+    <div class="controls">
+      <span class="pill" id="statusPill">connecting…</span>
+      <span class="pill" id="cameraPill">camera –</span>
+      <button type="button" id="toggleBtn">Pause</button>
+      <button type="button" class="ghost" id="resetBtn" title="Start the session totals over">Reset totals</button>
+    </div>
+  </header>
+  <p class="intro">Each camera frame goes through three steps. <b>1 · OOD detection:</b> the detector and its energy score split
+    the boxes into known classes and out-of-distribution (OOD) objects. <b>2 · Memory:</b> every OOD box is compared with the
+    objects the robot was taught in Part 1. A match names it, and the VLM is never asked. <b>3 · OED with the VLM:</b> only the
+    OOD boxes that memory can't name go to <span id="vlmName">Qwen3-VL</span>, which names them open-ended.
+    Box numbers (#1, #2, …) are the same on every image below.</p>
+  <div class="err" id="err"></div>
+
+  <!-- the method, with this frame's numbers -->
+  <section class="card">
+    <div class="flow">
+      <div class="node n-cam">
+        <div class="step">Input</div>
+        <div class="what">Camera frame</div>
+        <div class="big" id="fRes">–</div>
+        <div class="ms" id="fFrame">frame –</div>
+      </div>
+      <div class="node n-ood">
+        <div class="step">1 · OOD detection</div>
+        <div class="what">Detector + energy score</div>
+        <div class="big"><span id="fOod">–</span> <small>OOD</small></div>
+        <div class="split"><span class="c-faint" id="fKnown">– known</span></div>
+        <div class="ms" id="fDetMs">– ms</div>
+      </div>
+      <div class="node n-mem">
+        <div class="step">2 · Memory lookup</div>
+        <div class="what">DINOv2 views from Part 1</div>
+        <div class="big"><span id="fMem">–</span> <small>recognized</small></div>
+        <div class="split"><span class="c-vlm" id="fMiss">– not in memory → VLM</span></div>
+        <div class="ms" id="fMemMs">– ms</div>
+      </div>
+      <div class="node n-vlm">
+        <div class="step">3 · OED · VLM</div>
+        <div class="what" id="fVlmModel">Qwen3-VL names the rest</div>
+        <div class="big"><span id="fVlm">–</span> <small>asked</small></div>
+        <div class="split"><span class="c-faint" id="fVlmSplit">– new · – cached</span></div>
+        <div class="ms" id="fVlmMs">– ms</div>
+      </div>
+      <div class="node n-out">
+        <div class="step">Result</div>
+        <div class="what">Every object named</div>
+        <div class="split" style="margin-top:4px">
+          <span style="color:var(--known)" id="oKnown">– known</span>
+          <span class="c-mem" id="oMem">– memory</span>
+          <span class="c-vlm" id="oVlm">– VLM</span>
+          <span class="c-ood" id="oUnk">– unknown</span>
+        </div>
+        <div class="ms" id="fFps">– fps</div>
+      </div>
+    </div>
+    <div class="timebar">
+      <div class="bar" aria-label="Time per frame by step"><i id="tbDet" style="background:var(--ood)"></i><i id="tbMem" style="background:var(--memory)"></i><i id="tbVlm" style="background:var(--vlm)"></i></div>
+      <div class="keys">
+        <span>time this frame <b id="tTotal">–</b></span>
+        <span><i class="sw" style="background:var(--ood)"></i>OOD detection <b id="tDet">–</b></span>
+        <span><i class="sw" style="background:var(--memory)"></i>memory <b id="tMem">–</b></span>
+        <span><i class="sw" style="background:var(--vlm)"></i>VLM <b id="tVlm">–</b></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- two screens: before / after -->
+  <section class="screens">
+    <div class="card screen s-ood">
+      <div class="screen-head"><h2>Screen A · OOD detection only</h2><span class="muted num" id="aCount">–</span></div>
+      <div class="frame"><img id="imgOod" alt="Camera frame with the detector's boxes: known classes and unknown OOD objects" hidden><span class="ph" id="phOod">waiting for the first frame…</span></div>
+      <p>The detector on its own. It knows its training classes (blue). Everything else is only "unknown" (red), with no name.</p>
+    </div>
+    <div class="card screen s-all">
+      <div class="screen-head"><h2>Screen B · OOD + Memory + VLM</h2><span class="muted num" id="bCount">–</span></div>
+      <div class="frame"><img id="imgFinal" alt="The same frame after the pipeline, every OOD object named from memory or by the VLM" hidden><span class="ph" id="phFinal">waiting for the first frame…</span></div>
+      <p>The same frame after the pipeline. Objects the robot was taught get their names from memory (violet); new ones are named by the VLM (orange).</p>
+    </div>
+  </section>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--known)"></i>known class (detector)</span>
+    <span><i class="sw" style="background:var(--ood)"></i>OOD, no name yet</span>
+    <span><i class="sw" style="background:var(--memory)"></i>named from memory</span>
+    <span><i class="sw" style="background:var(--vlm)"></i>named by the VLM</span>
+    <span><i class="sw" style="background:#6e6e6e"></i>dashed: handled by another step</span>
+  </div>
+
+  <!-- the three steps, one at a time -->
+  <section class="steps">
+    <div class="card stepcard" style="--c:var(--ood)">
+      <div class="head">
+        <div><h2>Step 1 · OOD detection</h2><div class="sub">Which boxes are outside the training classes?</div></div>
+        <div class="metric"><span id="s1Big">–</span><small>OOD boxes</small></div>
+      </div>
+      <div class="frame"><img id="imgS1" alt="Only the OOD boxes, numbered" hidden><span class="ph">–</span></div>
+      <dl class="kv">
+        <dt>boxes in the frame</dt><dd id="s1Total">–</dd>
+        <dt>known classes</dt><dd id="s1Known">–</dd>
+        <dt>energy threshold τ</dt><dd id="s1Tau">–</dd>
+        <dt>time</dt><dd id="s1Ms">–</dd>
+      </dl>
+      <div class="rows" id="s1Rows"></div>
+    </div>
+
+    <div class="card stepcard" style="--c:var(--memory)">
+      <div class="head">
+        <div><h2>Step 2 · Memory lookup</h2><div class="sub">Has the robot been taught this object?</div></div>
+        <div class="metric"><span id="s2Big">–</span><small>recognized</small></div>
+      </div>
+      <div class="frame"><img id="imgS2" alt="OOD boxes recognized from memory; the others dashed" hidden><span class="ph">–</span></div>
+      <dl class="kv">
+        <dt>objects in memory</dt><dd id="s2Objs">–</dd>
+        <dt>match threshold</dt><dd id="s2Thres">–</dd>
+        <dt>sent on to the VLM</dt><dd id="s2Miss">–</dd>
+        <dt>time</dt><dd id="s2Ms">–</dd>
+      </dl>
+      <div class="rows" id="s2Rows"></div>
+    </div>
+
+    <div class="card stepcard" style="--c:var(--vlm)">
+      <div class="head">
+        <div><h2>Step 3 · VLM for the rest</h2><div class="sub">Open-ended names for what memory doesn't know</div></div>
+        <div class="metric"><span id="s3Big">–</span><small>asked</small></div>
+      </div>
+      <div class="frame"><img id="imgS3" alt="Boxes named by the VLM; the ones memory handled dashed" hidden><span class="ph">–</span></div>
+      <dl class="kv">
+        <dt>new VLM queries</dt><dd id="s3New">–</dd>
+        <dt>answered from the VLM cache</dt><dd id="s3Cached">–</dd>
+        <dt>skipped (named by memory)</dt><dd id="s3Skip">–</dd>
+        <dt>time</dt><dd id="s3Ms">–</dd>
+      </dl>
+      <div class="rows" id="s3Rows"></div>
+    </div>
+  </section>
+
+  <section class="bottom">
+    <div class="card">
+      <div class="card-head"><h2>This session</h2><span class="muted num" id="sessFrames">–</span></div>
+      <div class="tiles">
+        <div class="tile"><div class="v c-ood" id="tOod">–</div><div class="k">OOD boxes seen</div></div>
+        <div class="tile"><div class="v c-mem" id="tMemHits">–</div><div class="k">named from memory, no VLM</div></div>
+        <div class="tile"><div class="v c-vlm" id="tVlmAsk">–</div><div class="k">went to the VLM</div></div>
+        <div class="tile"><div class="v" id="tVlmNew">–</div><div class="k">new VLM queries run</div></div>
+        <div class="tile"><div class="v" id="tMs">–</div><div class="k">mean time per frame</div></div>
+        <div class="tile"><div class="v" id="tVlmMs">–</div><div class="k">mean VLM time per frame</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>What the robot remembers (from Part 1)</h2><span class="muted" id="memInfo">–</span></div>
+      <div class="gallery" id="gallery"><div class="empty">loads with the first frame…</div></div>
+      <p class="muted" style="margin:10px 0 0">Teach new objects in Part 1 (Ask &amp; Remember). They're used here from the next frame on; no restart needed.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  let seq = -1, memVersion = -1, paused = false, busy = false, last = null;
+
+  async function api(url, body) {
+    const res = await fetch(url, body === undefined ? { cache: 'no-store' }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+  const ms = (v) => v == null ? '–' : v >= 1000 ? (v / 1000).toFixed(2) + ' s' : Math.round(v) + ' ms';
+  const pct = (a, b) => b ? Math.round(100 * a / b) + '%' : '–';
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function viewUrl(file) { return '/api/hybrid/memory/view/' + file.split('/').map(encodeURIComponent).join('/'); }
+  function setImg(id, src) {
+    const img = $(id);
+    if (!src) return;
+    img.src = src; img.hidden = false;
+    const ph = img.parentNode.querySelector('.ph');
+    if (ph) ph.hidden = true;
+  }
+  function placeholders(text) { $('phOod').textContent = text; $('phFinal').textContent = text; }  // hidden once a frame shows
+
+  // ---------------------------------------------------------------- per-object rows
+  function thumb(src, alt) {
+    const i = el('img', 'thumb'); i.alt = alt; if (src) i.src = src; return i;
+  }
+  function row(thumbs, lines) {
+    const r = el('div', 'row');
+    const t = el('div', 'thumbs');
+    thumbs.forEach(function (x, k) { if (k) t.appendChild(el('span', 'eq', '≈')); t.appendChild(x); });
+    const body = el('div', 't');
+    lines.forEach(function (l) { body.appendChild(l); });
+    r.appendChild(t); r.appendChild(body);
+    return r;
+  }
+  function line1(n, name, nameCls, tagText, tagCls) {
+    const l = el('div', 'l1');
+    l.appendChild(el('span', 'id', '#' + n));
+    if (name) l.appendChild(el('span', 'name ' + (nameCls || ''), name));
+    if (tagText) l.appendChild(el('span', 'tag ' + (tagCls || ''), tagText));
+    return l;
+  }
+  function simBar(score, thres, good) {
+    const s = el('div', 'sim');
+    const fill = el('i'); fill.style.width = Math.max(0, Math.min(1, score)) * 100 + '%';
+    fill.style.setProperty('--c', good ? 'var(--memory)' : 'var(--text-faint)');
+    const mark = el('b'); mark.style.left = 'calc(' + thres * 100 + '% - 1px)'; mark.title = 'threshold ' + thres;
+    s.appendChild(fill); s.appendChild(mark);
+    return s;
+  }
+
+  function renderStep1(objs) {
+    const box = $('s1Rows'); box.textContent = '';
+    if (!objs.length) { box.appendChild(el('div', 'empty', 'No OOD objects in this frame.')); return; }
+    objs.forEach(function (o) {
+      const to = o.route === 'memory' ? ['→ memory', 'c-mem'] : ['→ memory → VLM', 'c-vlm'];
+      box.appendChild(row([thumb(o.crop, 'OOD box ' + o.n)],
+        [line1(o.n, 'unknown object', 'c-ood', to[0], to[1]), el('div', 'why', 'detector score ' + o.ood_score.toFixed(2))]));
+    });
+  }
+
+  function renderStep2(objs, mem) {
+    const box = $('s2Rows'); box.textContent = '';
+    if (!objs.length) { box.appendChild(el('div', 'empty', 'Nothing to look up.')); return; }
+    if (!mem.objects) { box.appendChild(el('div', 'empty', 'The memory is empty: teach objects in Part 1 first. Every OOD box goes to the VLM.')); }
+    objs.forEach(function (o) {
+      const m = o.memory, thres = mem.accept_thres;
+      const thumbs = [thumb(o.crop, 'OOD box ' + o.n)];
+      if (m && m.view && o.route === 'memory') thumbs.push(thumb(viewUrl(m.view), 'memory view of ' + m.name));
+      let lines;
+      if (o.route === 'memory') {
+        lines = [line1(o.n, m.name, 'c-mem', 'recognized', 'c-mem'),
+          el('div', 'why', 'similarity ' + m.score.toFixed(2) + ' ≥ ' + thres.toFixed(2) + (m.second > 0 ? ' · next best ' + m.second.toFixed(2) : '')),
+          simBar(m.score, thres, true)];
+      } else if (o.too_small) {
+        lines = [line1(o.n, 'too small to compare', 'c-faint', '→ VLM', 'c-vlm')];
+      } else if (!m) {
+        lines = [line1(o.n, 'nothing in memory', 'c-faint', '→ VLM', 'c-vlm')];
+      } else {
+        const why = m.score >= thres
+          ? 'best ' + m.name + ' ' + m.score.toFixed(2) + ', but too close to the next best (' + m.second.toFixed(2) + ')'
+          : 'best ' + m.name + ' ' + m.score.toFixed(2) + ' < ' + thres.toFixed(2);
+        lines = [line1(o.n, 'not in memory', 'c-faint', '→ VLM', 'c-vlm'), el('div', 'why', why), simBar(m.score, thres, false)];
+      }
+      box.appendChild(row(thumbs, lines));
+    });
+  }
+
+  function renderStep3(objs) {
+    const box = $('s3Rows'); box.textContent = '';
+    const rest = objs.filter(function (o) { return o.route === 'vlm'; });
+    const skipped = objs.filter(function (o) { return o.route === 'memory'; });
+    if (!rest.length) {
+      box.appendChild(el('div', 'empty', objs.length ? 'Memory named every OOD object: no VLM query this frame.' : 'Nothing to name.'));
+    }
+    rest.forEach(function (o) {
+      const tag = o.cached ? ['cached', 'c-faint'] : o.source === 'vlm2' ? ['stage 2', 'c-vlm'] : ['stage 1', 'c-vlm'];
+      const why = o.cached ? 'named on an earlier frame at this spot, no new query'
+        : o.source === 'vlm2' ? 'stage 1 was unsure, the verifier named it' : 'named by stage 1';
+      box.appendChild(row([thumb(o.crop, 'OOD box ' + o.n)], o.name
+        ? [line1(o.n, o.name, 'c-vlm', tag[0], tag[1]), el('div', 'why', why)]
+        : [line1(o.n, 'unknown', 'c-ood', tag[0], tag[1]), el('div', 'why', "the VLM couldn't name it either")]));
+    });
+    if (skipped.length) {
+      box.appendChild(el('div', 'empty', 'Skipped: ' + skipped.map(function (o) { return '#' + o.n + ' ' + o.name; }).join(', ') + ' (memory).'));
+    }
+  }
+
+  // ---------------------------------------------------------------- the frame
+  function renderFrame(d) {
+    const c = d.counts, t = d.timing, mem = d.memory;
+    setImg('imgOod', d.images.ood); setImg('imgFinal', d.images.final);
+    setImg('imgS1', d.images.step1); setImg('imgS2', d.images.step2); setImg('imgS3', d.images.step3);
+
+    $('fRes').textContent = d.resolution || '–';
+    $('fFrame').textContent = 'frame ' + d.frame_count;
+    $('fOod').textContent = c.ood; $('fKnown').textContent = c.known + ' known';
+    $('fDetMs').textContent = ms(t.detect_ms);
+    $('fMem').textContent = c.memory + ' / ' + c.ood; $('fMiss').textContent = c.vlm + ' not in memory → VLM';
+    $('fMemMs').textContent = ms(t.memory_ms);
+    $('fVlm').textContent = c.vlm; $('fVlmSplit').textContent = c.vlm_new + ' new · ' + c.vlm_cached + ' cached';
+    $('fVlmMs').textContent = c.vlm ? ms(t.vlm_ms) : 'not needed';
+    $('oKnown').textContent = c.known + ' known'; $('oMem').textContent = c.memory + ' memory';
+    $('oVlm').textContent = c.vlm_named + ' VLM'; $('oUnk').textContent = c.unknown + ' unknown';
+    $('fFps').textContent = t.fps ? t.fps.toFixed(1) + ' fps' : '– fps';
+
+    const total = Math.max(1, t.detect_ms + t.memory_ms + t.vlm_ms);
+    $('tbDet').style.width = 100 * t.detect_ms / total + '%';
+    $('tbMem').style.width = 100 * t.memory_ms / total + '%';
+    $('tbVlm').style.width = 100 * t.vlm_ms / total + '%';
+    $('tTotal').textContent = ms(t.frame_ms); $('tDet').textContent = ms(t.detect_ms);
+    $('tMem').textContent = ms(t.memory_ms); $('tVlm').textContent = ms(t.vlm_ms);
+
+    $('aCount').textContent = c.known + ' known · ' + c.ood + ' unknown';
+    $('bCount').textContent = c.known + ' known · ' + c.memory + ' memory · ' + c.vlm_named + ' VLM' + (c.unknown ? ' · ' + c.unknown + ' unknown' : '');
+
+    $('s1Big').textContent = c.ood; $('s1Total').textContent = c.total; $('s1Known').textContent = c.known;
+    $('s1Tau').textContent = d.energy_thres; $('s1Ms').textContent = ms(t.detect_ms);
+    $('s2Big').textContent = c.memory + ' / ' + c.ood; $('s2Objs').textContent = mem.objects;
+    $('s2Thres').textContent = mem.accept_thres.toFixed(2) + ' (margin ' + mem.margin.toFixed(2) + ')';
+    $('s2Miss').textContent = c.vlm; $('s2Ms').textContent = ms(t.memory_ms);
+    $('s3Big').textContent = c.vlm; $('s3New').textContent = c.vlm_new; $('s3Cached').textContent = c.vlm_cached;
+    $('s3Skip').textContent = c.memory; $('s3Ms').textContent = c.vlm ? ms(t.vlm_ms) : '0 ms';
+
+    renderStep1(d.objects); renderStep2(d.objects, mem); renderStep3(d.objects);
+    markHits(d.objects);
+  }
+
+  function renderTotals(tot) {
+    if (!tot || !tot.frames) {
+      ['tOod', 'tMemHits', 'tVlmAsk', 'tVlmNew', 'tMs', 'tVlmMs'].forEach(function (id) { $(id).textContent = '–'; });
+      $('sessFrames').textContent = '0 frames';
+      return;
+    }
+    $('sessFrames').textContent = tot.frames + ' frames';
+    $('tOod').textContent = tot.ood;
+    $('tMemHits').textContent = tot.memory + ' (' + pct(tot.memory, tot.ood) + ')';
+    $('tVlmAsk').textContent = tot.vlm + ' (' + pct(tot.vlm, tot.ood) + ')';
+    $('tVlmNew').textContent = tot.vlm_new;
+    $('tMs').textContent = ms((tot.detect_ms + tot.memory_ms + tot.vlm_ms) / tot.frames);
+    $('tVlmMs').textContent = ms(tot.vlm_ms / tot.frames);
+  }
+
+  // ---------------------------------------------------------------- memory gallery
+  async function loadMemory() {
+    try {
+      const m = await api('/api/hybrid/memory');
+      const g = $('gallery'); g.textContent = '';
+      $('memInfo').textContent = m.objects.length + ' object' + (m.objects.length === 1 ? '' : 's');
+      if (!m.objects.length) g.appendChild(el('div', 'empty', 'Empty: nothing taught yet.'));
+      m.objects.forEach(function (o) {
+        const c = el('div', 'mem'); c.dataset.id = o.id;
+        const i = el('img'); i.alt = o.name; i.loading = 'lazy'; if (o.thumb) i.src = viewUrl(o.thumb);
+        c.appendChild(i); c.appendChild(el('div', 'nm', o.name)); c.lastChild.title = o.name;
+        c.appendChild(el('div', 'vw', o.n_views + ' view' + (o.n_views === 1 ? '' : 's')));
+        g.appendChild(c);
+      });
+      memVersion = m.version;
+      if (last && last.objects) markHits(last.objects);
+    } catch (e) { /* next frame retries */ }
+  }
+  function markHits(objs) {
+    const hit = {};
+    objs.forEach(function (o) { if (o.route === 'memory' && o.memory) hit[o.memory.object_id] = true; });
+    document.querySelectorAll('.mem[data-id]').forEach(function (c) { c.classList.toggle('hit', !!hit[c.dataset.id]); });
+  }
+
+  // ---------------------------------------------------------------- status + polling
+  function renderStatus(d) {
+    const pill = $('statusPill');
+    paused = !d.enabled;
+    $('toggleBtn').textContent = paused ? 'Resume' : 'Pause';
+    $('cameraPill').textContent = 'camera ' + d.camera;
+    $('cameraPill').dataset.mode = d.camera === 'on' ? 'on' : 'warn';
+    let err = '';
+    if (d.error) { pill.dataset.mode = 'error'; pill.textContent = 'stopped'; err = 'Part 3 stopped: ' + d.error + ' (press Resume to try again)'; }
+    else if (paused) { pill.dataset.mode = ''; pill.textContent = 'PAUSED'; }
+    else if (d.module3) { pill.dataset.mode = 'warn'; pill.textContent = 'Module 3 has the GPU'; err = 'Module 3 (VLM only) is running on this server. Stop it on the main page to continue here.'; }
+    else if (d.camera !== 'on') { pill.dataset.mode = 'warn'; pill.textContent = 'waiting for the camera'; err = d.camera === 'off' ? 'The camera is switched off for this server. Open Part 3 from the main page; it hands the RealSense over.' : ''; }
+    else if (d.warming) { pill.dataset.mode = 'warn'; pill.textContent = 'loading…'; placeholders(d.warming); }
+    else if (!d.ready) { pill.dataset.mode = 'warn'; pill.textContent = 'starting…'; }
+    else { pill.dataset.mode = 'on'; pill.textContent = 'RUNNING'; }
+    $('err').textContent = err;
+    if (d.vlm_model) {
+      const short = d.vlm_model.split('/').pop();
+      $('vlmName').textContent = short;
+      $('fVlmModel').textContent = short + ' names the rest';
+    }
+  }
+
+  async function poll() {
+    try {
+      const d = await api('/api/hybrid/latest?since=' + seq);
+      renderStatus(d);
+      if (d.ready && !d.unchanged && d.images) { last = d; seq = d.seq; renderFrame(d); }
+      renderTotals(d.totals);
+      if (d.memory && d.memory.version !== memVersion) loadMemory();
+    } catch (e) {
+      $('statusPill').dataset.mode = 'error'; $('statusPill').textContent = 'unavailable'; $('err').textContent = e.message;
+    } finally { setTimeout(poll, 250); }
+  }
+
+  async function setEnabled(on) {
+    try { renderStatus(Object.assign({}, last || {}, await api('/api/hybrid', { enabled: on }), { camera: (last && last.camera) || '–' })); }
+    catch (e) { $('err').textContent = e.message; }
+  }
+  $('toggleBtn').addEventListener('click', async function () {
+    if (busy) return;
+    busy = true; this.disabled = true;
+    try { await setEnabled(paused); } finally { busy = false; this.disabled = false; }
+  });
+  $('resetBtn').addEventListener('click', function () { api('/api/hybrid', { reset: true }).catch(function () {}); });
+
+  // On while this page is open: off when it closes (or goes to another module page in the same window).
+  window.addEventListener('pagehide', function () {
+    navigator.sendBeacon('/api/hybrid', new Blob([JSON.stringify({ enabled: false })], { type: 'application/json' }));
+  });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) setEnabled(true); });
+
+  setEnabled(true).then(poll);
+})();
+</script>
+</body>
+</html>

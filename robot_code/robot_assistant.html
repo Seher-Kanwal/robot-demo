@@ -386,8 +386,22 @@
     robot.dataset.state = state;
     if (text !== undefined) robotStatus.innerHTML = text;
   }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+  }
+  let activeSearches = [];  // from /api/assistant/state
   function restFace() {
-    if (busy || (synth && synth.speaking)) return;
+    if (busy || pttActive || (synth && synth.speaking)) return;
+    const checking = activeSearches.filter(function (s) { return s.checking; })[0];
+    if (checking) {
+      setFace('thinking', 'Checking this view for <b>' + esc(checking.target) + '</b>&hellip;');
+      return;
+    }
+    const searching = activeSearches.filter(function (s) { return s.state === 'searching'; })[0];
+    if (searching) {
+      setFace(idleState(), 'Looking for <b>' + esc(searching.target) + '</b> &mdash; turn me to a new view and hold still');
+      return;
+    }
     setFace(idleState(), handsActive
       ? 'Listening — say <b>&ldquo;Robot, where are my &hellip;?&rdquo;</b>'
       : 'Type a question, or hold <b>🎤</b> / <b>Space</b> to talk');
@@ -419,8 +433,9 @@
   // --- chat ---
   const OUTCOME_CHIPS = {
     found_live: ['live view', 'live'], found_memory: ['from memory', 'memory'],
-    found_grounding: ['Qwen searched the frame', 'vlm'], not_found: ['still looking', 'miss'],
-    found: ['spotted', 'live'], moved: ['moved', 'live'], error: ['error', 'miss'],
+    found_grounding: ['Qwen searched the frame', 'vlm'], not_found: ['not in this view', 'miss'],
+    found: ['spotted', 'live'], moved: ['moved', 'live'], not_here: ['not in this view', 'miss'],
+    error: ['error', 'miss'],
   };
   function pad2(n) { return String(n).padStart(2, '0'); }
   function addMsg(who, text, opts) {
@@ -723,7 +738,9 @@
       chip.className = 'search-chip';
       chip.appendChild(document.createTextNode(s.target + ' '));
       const st = document.createElement('small');
-      st.textContent = s.state === 'tracking' ? 'tracking' : 'searching';
+      st.textContent = s.state === 'tracking' ? 'found'
+        : s.checking ? 'checking view…'
+        : 'searching · ' + s.looks + (s.looks === 1 ? ' view' : ' views');
       chip.appendChild(st);
       const x = document.createElement('button');
       x.type = 'button';
@@ -787,6 +804,8 @@
       if (!res.ok) throw new Error(data.error || 'request failed');
       renderCamera(data.camera, data.highlights);
       renderSearches(data.searches);
+      activeSearches = data.searches;
+      restFace();
       renderScene(data.scene);
       if (!eventsPrimed) {
         eventsPrimed = true;  // don't replay announcements made before this page was opened
@@ -807,7 +826,7 @@
   }
 
   addMsg('robot', "Hi! I can find things for you. Ask me something like “Robot, where are my headphones?” " +
-    "and drive me around — I'll keep an eye out.");
+    "I'll look at what I see now, and if it isn't there I'll ask you to turn me to a new view and look again.");
   restFace();
   startHands();
   pollOnce();

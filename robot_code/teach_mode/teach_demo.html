@@ -76,6 +76,17 @@
   body.explore .grid { grid-template-columns: 1fr 1fr; }
   @media (max-width: 1000px) { body.explore .grid { grid-template-columns: 1fr; } }
 
+  /* ---- compact (?compact=1, the left half of the hub's Teach & Replay): one view -- the
+     detector's boxes plus the yellow box being asked about -- and the question, nothing else ---- */
+  body.compact { padding: 10px; }
+  body.compact .page { gap: 10px; }
+  body.compact header.top, body.compact ol.steps, body.compact #oodView, body.compact #recCard,
+  body.compact #memCard, body.compact .voice-log { display: none; }
+  body.compact .views { grid-template-columns: 1fr; }
+  body.compact .grid { grid-template-columns: 1fr; gap: 10px; }
+  body.compact .card { padding: 12px 14px; }
+  body.compact .bubble { font-size: 16px; }
+
   /* ---- 7-step tracker ---- */
   ol.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
   ol.steps li {
@@ -175,24 +186,15 @@
   .cap-foot button { flex: 1; }
   kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 
-  /* ---- start gate (browsers only allow voice/mic after a click) ---- */
-  .gate { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; }
-  .gate[hidden] { display: none; }
-  .gate-card { max-width: 460px; text-align: center; }
-  .gate-card p { color: var(--text-dim); }
-  .gate-card button { font-size: 18px; padding: 14px 28px; }
+  /* ---- voice bar: the page starts by itself, but Chrome only lets it speak after a click ---- */
+  .voice-bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 20; max-width: calc(100% - 32px);
+    padding: 10px 18px; border-radius: 999px; border: 1px solid var(--ask); background: color-mix(in srgb, var(--ask) 18%, var(--panel));
+    color: var(--text); font-size: 15px; cursor: pointer; box-shadow: 0 8px 30px rgba(0,0,0,.4); }
+  .voice-bar[hidden] { display: none; }
 </style>
 </head>
 <body>
-<div class="gate" id="gate">
-  <div class="gate-card">
-    <div class="kicker">Module 1 · Ask &amp; Remember</div>
-    <h1>Teach the robot</h1>
-    <p>The robot asks about objects it doesn't recognize, learns them from a few views, and finds them again later.
-       Click start to turn on its voice and microphone.</p>
-    <button id="startBtn" type="button">Start</button>
-  </div>
-</div>
+<div class="voice-bar" id="voiceBar" role="button" tabindex="0" hidden>&#128264; Click anywhere to turn on the robot's voice</div>
 
 <div class="page">
   <header class="top">
@@ -277,7 +279,7 @@
       <ul class="voice-log" id="voiceLog"></ul>
     </div>
 
-    <div class="card">
+    <div class="card" id="recCard">
       <h2>7 · Recognized from memory</h2>
       <div class="pills" id="recPills"><span class="muted">nothing yet</span></div>
       <h2 style="margin-top:16px">Known (VOC) in view</h2>
@@ -285,7 +287,7 @@
     </div>
   </section>
 
-  <section class="card">
+  <section class="card" id="memCard">
     <h2>5 · Memory: name + multi-view features</h2>
     <div class="muted" id="memMeta"></div>
     <div class="mem-objects" id="memObjects"></div>
@@ -321,8 +323,11 @@
 (function () {
   'use strict';
   const $ = (id) => document.getElementById(id);
+  const COMPACT = new URLSearchParams(location.search).get('compact') === '1';
+  if (COMPACT) document.body.classList.add('compact');
+  const VIEW_NAME = COMPACT ? 'OOD detector' : 'Robot view';  // compact shows only this view
   const el = {
-    gate: $('gate'), startBtn: $('startBtn'), statusPill: $('statusPill'),
+    voiceBar: $('voiceBar'), statusPill: $('statusPill'),
     voice: $('voiceToggle'), handsFree: $('handsFreeToggle'), autoSubmit: $('autoSubmitToggle'),
     steps: $('steps'), oodImg: $('oodImg'), robotImg: $('robotImg'), oodWait: $('oodWait'), robotWait: $('robotWait'),
     askCard: $('askCard'), askIdle: $('askIdle'), askActive: $('askActive'), askCrop: $('askCrop'), askForm: $('askForm'),
@@ -394,10 +399,30 @@
     try { localStorage.setItem('teach_voice_uri', voiceSelect.value); } catch (e) { /* ignore */ }
   });
 
+  // Chrome refuses to speak ("not-allowed") until the page has been clicked once. The page
+  // starts by itself anyway; a blocked line waits behind a small bar and is spoken on the
+  // first click or key press anywhere (the microphone needs no click once it's allowed).
+  let voiceBlocked = false, blockedLine = null;
+  function blockVoice(text) {
+    voiceBlocked = true;
+    blockedLine = text;
+    el.voiceBar.hidden = false;
+  }
+  function unblockVoice() {
+    if (!voiceBlocked) return;
+    voiceBlocked = false;
+    el.voiceBar.hidden = true;
+    const line = blockedLine;
+    blockedLine = null;
+    if (line) say(line);
+  }
+  ['pointerdown', 'keydown'].forEach(function (type) { window.addEventListener(type, unblockVoice, true); });
+
   function say(text, onend) {
     el.bubble.textContent = text;
     logLine(text);
     if (!el.voice.checked || !synth) { if (onend) setTimeout(onend, 50); return; }
+    if (voiceBlocked) { blockedLine = text; if (onend) setTimeout(onend, 50); return; }
     const u = new SpeechSynthesisUtterance(text);
     const v = voices.find(function (x) { return x.voiceURI === voiceSelect.value; });
     if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
@@ -405,7 +430,8 @@
     const finish = function () { if (done) return; done = true; speaking.delete(u); if (onend) onend(); };
     u.onend = finish;
     u.onerror = function (ev) {
-      if (ev.error !== 'interrupted' && ev.error !== 'canceled') {
+      if (ev.error === 'not-allowed') blockVoice(text);
+      else if (ev.error !== 'interrupted' && ev.error !== 'canceled') {
         logLine('voice error: ' + ev.error + (v && !v.localService ? ' (online voice — needs internet; try a local one)' : ''), true);
       }
       finish();
@@ -511,6 +537,7 @@
 
   function render(d) {
     if (d.error) { el.statusPill.dataset.mode = 'error'; el.statusPill.textContent = 'camera error: ' + d.error; }
+    else if (d.camera === 'off') { el.statusPill.dataset.mode = 'wait'; el.statusPill.textContent = 'camera paused · another part has it'; }
     else if (d.frozen && !d.capture) {
       el.statusPill.dataset.mode = 'wait';
       el.statusPill.textContent = 'PAUSED · ' + (d.frozen.named + d.frozen.skipped) + '/' + d.frozen.total + ' named';
@@ -537,7 +564,8 @@
     renderAsk(d.asking, d.queue_len, d.capture, d.frozen);
     renderCapture(d.capture);
     if (d.mode !== 'explore') {
-      $('robotTitle').textContent = d.frozen && !d.capture ? 'Robot view · paused on this image' : 'Robot view';
+      $('robotTitle').textContent = d.frozen && !d.capture
+        ? VIEW_NAME + ' · paused: the robot asks about the yellow box' : VIEW_NAME;
     }
 
     el.recPills.innerHTML = '';
@@ -570,7 +598,7 @@
     $('modeExplore').setAttribute('aria-pressed', explore ? 'true' : 'false');
     $('exploreBanner').hidden = !explore;
     $('exploreConf').textContent = d.explore_ood_conf;
-    $('robotTitle').textContent = explore ? 'Robot view · explore' : 'Robot view';
+    $('robotTitle').textContent = explore ? VIEW_NAME + ' · explore' : VIEW_NAME;
     if (explore && recMode === 'name') stopListening();
   }
   async function setMode(mode) {
@@ -782,14 +810,11 @@
     });
   }
 
-  // ---------------------------------------------------------------- start
-  el.startBtn.addEventListener('click', function () {
-    el.gate.hidden = true;
-    el.oodImg.src = '/stream/ood.mjpg';
-    el.robotImg.src = '/stream/robot.mjpg';
-    say('Hello! Show me some objects. I will ask about anything I do not recognize.');
-    poll();
-  });
+  // ---------------------------------------------------------------- start (right away, no Start click)
+  if (!COMPACT) el.oodImg.src = '/stream/ood.mjpg';  // hidden in compact: don't stream it
+  el.robotImg.src = '/stream/robot.mjpg';
+  say('Hello! Show me some objects. I will ask about anything I do not recognize.');
+  poll();
 })();
 </script>
 </body>

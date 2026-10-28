@@ -645,22 +645,21 @@
   }
 
   /* Camera-only view (the default; ?full=1 shows the whole demo page): nothing but the
-     live labeled camera frame, as large as the window allows. */
+     live camera frames, as large as the window allows. */
   body.camera-only { padding: 12px; }
   body.camera-only .page { max-width: none; gap: 0; }
   body.camera-only .page > :not(#liveConsole) { display: none !important; }
   body.camera-only #liveConsole { display: block !important; }
   body.camera-only #liveConsole .side,
-  body.camera-only #liveConsole .statusbar,
-  body.camera-only #liveConsole .frame-caption,
-  body.camera-only #liveConsole .frame-col:first-child { display: none; }
-  body.camera-only #liveConsole .frame-dual { display: block; background: #000; }
+  body.camera-only #liveConsole .statusbar { display: none; }
+  /* The OOD-only frame and the VLM-labeled frame of the same camera picture side by side,
+     so the presentation shows what the VLM adds on top of the energy OOD split. */
+  body.camera-only #liveConsole .frame-dual { background: #000; gap: 2px; }
   body.camera-only #liveConsole .frame img {
-    width: auto; max-width: 100%;
-    height: calc(100vh - 24px - 42px); object-fit: contain;
-    margin: 0 auto;
+    width: 100%; height: auto;
+    max-height: calc(100vh - 24px - 42px - 190px); object-fit: contain;
   }
-  body.camera-only #liveConsole .frame-placeholder { height: calc(100vh - 24px - 42px); aspect-ratio: auto; }
+  body.camera-only #liveConsole .frame-placeholder { height: auto; aspect-ratio: 16 / 9; }
 
   /* --- Qwen3-VL direct baseline (whole image -> VLM boxes + labels, no detector) ----- */
   .stat dd.qwen { color: var(--qwen); }
@@ -752,7 +751,32 @@
   .cmp-results .qwen { color: var(--qwen); }
   .cmp-results td.lbl { font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }
   .cmp-results .cmp-note { margin: 6px 0 0; font-size: 11.5px; color: var(--text-faint); }
-  body.camera-only #liveConsole.qwen-on .frame img { max-height: calc(100vh - 24px - 42px - 24px - 230px); }
+  body.camera-only #liveConsole.qwen-on .frame img { max-height: calc(100vh - 24px - 42px - 190px - 230px); }
+
+  /* Headings of the live view: a title saying what's compared, and over each frame a step
+     number, what that frame shows, and a key to its box colors (the colors annotate() and
+     annotate_qwen_direct() draw, so fixed, not themed). */
+  .live-head { padding: 12px 16px 10px; border-bottom: 1px solid var(--border-soft); background: var(--panel); }
+  .live-head h2 { margin: 0; font-family: var(--sans); font-size: 20px; font-weight: 600; color: var(--text); }
+  .live-head p { margin: 3px 0 0; font-size: 13.5px; line-height: 1.45; color: var(--text-dim); }
+  .frame-caption.col-head {
+    padding: 10px 14px;
+    font-family: var(--sans);
+    letter-spacing: normal;
+    text-transform: none;
+    text-align: left;
+  }
+  .col-head .col-title { font-size: 16px; font-weight: 600; line-height: 22px; color: var(--text); }
+  .col-head .step {
+    display: inline-grid; place-items: center; vertical-align: top;
+    width: 22px; height: 22px; margin-right: 8px; border-radius: 50%;
+    font-family: var(--mono); font-size: 12px;
+    color: var(--bg); background: var(--accent);
+  }
+  .col-head .col-sub { margin-top: 2px; font-size: 13px; line-height: 1.4; color: var(--text-dim); }
+  .col-head .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; color: var(--text-dim); }
+  .col-head .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .col-head .legend i { width: 14px; height: 10px; border: 2px solid var(--sw); border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -1045,9 +1069,19 @@
           title="Run Qwen3-VL on the whole live frame, no detector, side by side with this pipeline">Compare with Qwen3-VL direct</button>
         <span class="rec" id="liveStatusPill" data-mode="ready"><span class="pulse"></span><span id="liveStatusText">READY</span></span>
       </div>
+      <div class="live-head">
+        <h2><span class="cap-default">OOD + VLM: what the VLM adds</span><span class="cap-compare">OOD + VLM vs VLM only</span></h2>
+        <p><span class="cap-default">The same live camera frame, twice. Left: the detector finds the objects and flags the ones it doesn't know.
+          Right: Qwen3-VL then gives those unknown objects a name.</span><span class="cap-compare">The same live camera frames.
+          Left: our pipeline (detector + energy OOD + VLM). Right: Qwen3-VL alone on the whole image, no detector.</span></p>
+      </div>
       <div class="frame-dual">
         <div class="frame-col ood-col">
-          <div class="frame-caption">OOD detection (energy split)</div>
+          <div class="frame-caption col-head">
+            <div class="col-title"><span class="step">1</span>OOD detection only</div>
+            <div class="col-sub">Faster R-CNN + energy score decide whether each object is known or unknown. Unknown objects get no name.</div>
+            <div class="legend"><span><i style="--sw:#0000ff"></i>known class</span><span><i style="--sw:#ff0000"></i>unknown (OOD)</span></div>
+          </div>
           <div class="frame">
             <img id="liveFrameImgOod" alt="live OOD-only annotated frame" style="display:none;">
             <div class="frame-placeholder" id="liveFramePlaceholderOod">waiting for the first frame&hellip;</div>
@@ -1058,7 +1092,11 @@
           </div>
         </div>
         <div class="frame-col">
-          <div class="frame-caption"><span class="cap-default">VLM labeling</span><span class="cap-compare">Our pipeline — detector + energy OOD + VLM</span></div>
+          <div class="frame-caption col-head">
+            <div class="col-title"><span class="cap-default"><span class="step">2</span>OOD + VLM naming</span><span class="cap-compare">Our pipeline: OOD + VLM</span></div>
+            <div class="col-sub">Same boxes; Qwen3-VL names only the unknown ones. If it can't, the robot asks you.</div>
+            <div class="legend"><span><i style="--sw:#0000ff"></i>known class</span><span><i style="--sw:#f5a623"></i>named by VLM</span><span><i style="--sw:#b478e0"></i>from memory</span><span><i style="--sw:#ffff00"></i>named by you</span><span><i style="--sw:#ff0000"></i>still unknown</span></div>
+          </div>
           <div class="frame">
             <img id="liveFrameImg" alt="live annotated frame" style="display:none;">
             <div class="frame-placeholder" id="liveFramePlaceholder">waiting for the first frame&hellip;</div>
@@ -1070,7 +1108,11 @@
           </div>
         </div>
         <div class="frame-col qwen-col">
-          <div class="frame-caption">Qwen3-VL direct — whole image, no detector</div>
+          <div class="frame-caption col-head">
+            <div class="col-title">VLM only (baseline)</div>
+            <div class="col-sub">Qwen3-VL gets the whole image and finds and names every object by itself, no detector.</div>
+            <div class="legend"><span><i style="--sw:#3ecf8e"></i>found + named by Qwen3-VL</span></div>
+          </div>
           <div class="frame">
             <img id="liveQwenImg" alt="live Qwen3-VL direct annotated frame" style="display:none;">
             <div class="frame-placeholder" id="liveQwenPlaceholder">Qwen is reading the frame&hellip; each pass takes several seconds</div>
@@ -1894,6 +1936,12 @@
       const res = await fetch('/api/live/latest');
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'request failed');
+      if (data.camera === 'off') {  // the hub handed the camera to another part of the demo
+        liveStatusPill.dataset.mode = 'ready';
+        liveStatusText.textContent = 'CAMERA PAUSED';
+        liveStatus.textContent = 'another part of the demo has the camera';
+        return;
+      }
       if (!data.ready) {
         liveStatusText.textContent = 'WAITING';
         liveStatus.textContent = 'connected to the topic, waiting for the first frame…';

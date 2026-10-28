@@ -78,7 +78,8 @@
   function render(d) {
     const status = $('status');
     status.className = 'pill' + (d.error ? ' bad' : d.ready ? ' live' : '');
-    status.textContent = d.error ? 'camera error: ' + d.error : d.ready ? 'LIVE · ' + d.fps + ' fps' : 'starting camera…';
+    status.textContent = d.error ? 'camera error: ' + d.error : d.camera === 'off' ? 'camera paused'
+      : d.ready ? 'LIVE · ' + d.fps + ' fps' : 'starting camera…';
     if (d.ready && !streaming) {
       streaming = true;
       $('img').src = '/stream/recognize.mjpg';

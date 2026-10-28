@@ -15,8 +15,10 @@ Python that runs the hub; output goes to robot_code/hub/logs/<name>.log):
 
 It also recognizes copies that were started by hand in a terminal (by script name), so
 the page shows the real state, and Stop works on those too. Only one process can own the
-RealSense: starting something that needs it while another service holds it is refused
-until the page confirms stopping the other one first.
+RealSense at a time, but both modules can let go of it and take it back without exiting
+(their /api/camera), so the hub hands the camera over instead of stopping the other module:
+its models stay loaded and switching back is instant. A copy that can't do that (started
+from older code) is stopped instead.
 
 Tool buttons run one-shot commands (tests, threshold calibration, memory listing, camera
 and GPU checks) and stream their output into the page.
@@ -135,12 +137,37 @@ def _scan():
     return found
 
 
-def _uses_camera(name, cmdline):
+def _camera_capable(name, cmdline):
+    """Started on the RealSense (it may have switched the camera off since)."""
     if name == "module1":
         return "--source" not in cmdline
     if name == "module2":
         return "--realsense" in cmdline
     return False
+
+
+def _uses_camera(name, cmdline):
+    """Takes the RealSense as soon as it starts."""
+    return _camera_capable(name, cmdline) and "--camera-off" not in cmdline
+
+
+def _service_url(name):
+    return f"http://127.0.0.1:{SERVICES[name]['port']}"
+
+
+def _camera_holder(name, state, cmdlines):
+    """(holds the camera now, can hand it over). A running module says so itself
+    (/api/camera); otherwise go by its command line."""
+    capable = any(_camera_capable(name, cl) for cl in cmdlines)
+    if not capable:
+        return False, False
+    if state == "running":
+        try:
+            cam = _http_json(f"{_service_url(name)}/api/camera", timeout=0.5)
+            return cam.get("camera") != "off" or bool(cam.get("wanted")), True
+        except (OSError, ValueError):
+            pass
+    return any(_uses_camera(name, cl) for cl in cmdlines), False
 
 
 def _log_tail(name, lines=40):
@@ -178,11 +205,13 @@ def _status():
         else:
             state = "stopped"
         mine = bool(m and m["proc"].poll() is None)
+        holds, handover = _camera_holder(n, state, [p["cmdline"] for p in insts])
         out[n] = {
             "name": n, "title": s["title"], "state": state, "port": s["port"],
             "url": f"http://127.0.0.1:{s['port']}/" if s["port"] else None,
             "pids": [p["pid"] for p in insts], "instances": len(insts),
-            "camera": any(_uses_camera(n, p["cmdline"]) for p in insts),
+            "camera": holds, "camera_handover": handover,
+            "camera_capable": any(_camera_capable(n, p["cmdline"]) for p in insts),
             "external": bool(insts) and not mine,
             "started": insts[0]["create_time"] if insts else None,
             "exit_code": m["proc"].poll() if m else None,
@@ -197,7 +226,7 @@ def _module3_status(m2):
     """Module 3 lives inside the module2 server: it's "running" when that server has the
     Qwen-direct baseline switched on in solo mode."""
     q = None
-    if m2["state"] == "running" and m2["camera"]:
+    if m2["state"] == "running" and m2["camera_capable"]:
         try:
             q = _http_json(f"{MODULE2_URL}/api/qwen-direct/live/latest?light=1", timeout=1.0)
         except (OSError, ValueError):
@@ -217,7 +246,7 @@ def _module3_status(m2):
     return {
         "name": "module3", "title": MODULE3_TITLE, "state": state, "port": SERVICES["module2"]["port"],
         "url": f"{MODULE2_URL}/qwen-direct", "pids": m2["pids"], "instances": m2["instances"],
-        "camera": False,  # the camera belongs to the module2 process -- counted there
+        "camera": False, "camera_handover": False, "camera_capable": False,  # module2's, counted there
         "external": m2["external"], "started": m2["started"], "exit_code": None, "options": None,
         "log": m2["log"], "detail": detail, "server_state": m2["state"],
     }
@@ -249,7 +278,7 @@ def stop_service(name):
         if name == "module2":
             MODULE3.update(waiting=False, token=MODULE3["token"] + 1)
         insts = _scan()[name]
-        had_camera = any(_uses_camera(name, p["cmdline"]) for p in insts)
+        had_camera = any(_camera_capable(name, p["cmdline"]) for p in insts)
         _kill_tree([p["pid"] for p in insts])
         m = MANAGED.get(name)
         if m:
@@ -287,6 +316,8 @@ def build_cmd(name, opts):
             cmd += ["--match-known-boxes"]
         if opts.get("dual_view"):
             cmd += ["--dual-view"]
+        if opts.get("camera_off"):
+            cmd += ["--camera-off"]
     elif name == "module2":
         cmd += ["--no-vllm", "--port", str(s["port"]), "--weights", WEIGHTS,
                 "--conf-thres", _num(opts, "conf_thres", 0.9), "--energy-thres", _num(opts, "energy_thres", -6.84),
@@ -295,6 +326,8 @@ def build_cmd(name, opts):
                 "--verify-model-id", VERIFY_MODEL_ID]
         if opts.get("realsense", True):
             cmd += ["--realsense"]
+            if opts.get("camera_off"):
+                cmd += ["--camera-off"]
     return cmd
 
 
@@ -315,9 +348,10 @@ def start_service(name, opts, force=False):
                                                            st["module3"]["state"] == "running" else "")
                                    for o in owners)
                 return 409, {"conflict": owners,
-                             "error": f"The RealSense is in use by {titles}. Stop it and start {SERVICES[name]['title']}?"}
+                             "error": f"The RealSense is in use by {titles}. Hand it to {SERVICES[name]['title']}? "
+                                      f"(The other module stays loaded.)"}
             for o in owners:
-                stop_service(o)
+                release_camera(o, st[o])
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log = open(LOG_DIR / f"{name}.log", "w", encoding="utf-8")
         log.write(f"[hub] {datetime.now():%Y-%m-%d %H:%M:%S} starting: {subprocess.list2cmdline(cmd)}\n")
@@ -328,6 +362,45 @@ def start_service(name, opts, force=False):
         log.close()  # the child keeps its own handle
         MANAGED[name] = {"proc": proc, "cmd": cmd, "started": time.time(), "stopped": False, "options": opts}
         return 200, {"ok": True, "pid": proc.pid}
+
+
+def release_camera(name, status):
+    """Makes `name` let go of the RealSense, keeping its models loaded; a copy that can't
+    (older code) is stopped instead. Module 3 is switched off first: it would stall."""
+    if name == "module2":
+        MODULE3.update(waiting=False, token=MODULE3["token"] + 1)
+        try:
+            _set_module3(False)
+        except (OSError, ValueError):
+            pass
+    if status.get("camera_handover"):
+        try:
+            _http_json(f"{_service_url(name)}/api/camera", {"on": False}, timeout=40.0)
+            return
+        except (OSError, ValueError):
+            pass
+    stop_service(name)
+
+
+def take_camera(name):
+    """Hands the RealSense to an already running module. Returns (status_code, payload)."""
+    with LOCK:
+        st = _status()
+        me = st[name]
+        if me["state"] != "running":
+            return 409, {"error": f"{me['title']} is not running"}
+        if not me["camera_capable"]:
+            return 409, {"restart": True, "error": f"{me['title']} was started without the RealSense"}
+        if not me["camera_handover"]:
+            return (200, {"ok": True}) if me["camera"] else (409, {"restart": True, "error": "restart it to use the camera"})
+        for o in SERVICES:
+            if o != name and st[o]["camera"]:
+                release_camera(o, st[o])
+        try:
+            _http_json(f"{_service_url(name)}/api/camera", {"on": True}, timeout=5.0)
+        except (OSError, ValueError) as e:
+            return 502, {"error": f"{me['title']} didn't take the camera: {e}"}
+        return 200, {"ok": True}
 
 
 def _set_module3(enabled):
@@ -343,6 +416,9 @@ def _enable_module3_when_ready(token):
             if MODULE3["token"] != token:
                 return
         try:
+            code, _body = take_camera("module2")  # it may have started with the camera off
+            if code != 200:
+                raise OSError("Module 2 is still starting")
             _set_module3(True)
             with LOCK:
                 if MODULE3["token"] == token:
@@ -360,7 +436,7 @@ def start_module3(module2_opts, force=False, restart=False):
         st = _status()
         m2 = st["module2"]
         MODULE3["error"] = None
-        if m2["state"] in ("running", "starting") and not m2["camera"]:
+        if m2["state"] in ("running", "starting") and not m2["camera_capable"]:
             if not restart:
                 return 409, {"restart": True, "error": "Module 2's server is running without the RealSense, which "
                                                        "Module 3 needs. Restart it with the camera?"}
@@ -371,6 +447,9 @@ def start_module3(module2_opts, force=False, restart=False):
             if code != 200:
                 return code, body
         elif m2["state"] == "running":
+            code, body = take_camera("module2")
+            if code != 200:
+                return code, body
             try:
                 _set_module3(True)
                 return 200, {"ok": True}
@@ -470,6 +549,33 @@ def api_stop(name):
     if name not in SERVICES:
         return jsonify({"error": "unknown service"}), 404
     return jsonify({"ok": True, "stopped": stop_service(name)})
+
+
+@app.route("/api/service/<name>/camera", methods=["POST"])
+def api_camera(name):
+    """{"on": true}: hand the RealSense to this running module (the others let go of it, models
+    stay loaded). {"on": false}: it lets go."""
+    if name not in SERVICES:
+        return jsonify({"error": "unknown service"}), 404
+    if (request.get_json(silent=True) or {}).get("on"):
+        code, body = take_camera(name)
+        return jsonify(body), code
+    with LOCK:
+        st = _status()
+        if st[name]["camera"]:
+            release_camera(name, st[name])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/module1/dual", methods=["POST"])
+def api_module1_dual():
+    """Switches Module 1's side-by-side recognize view (Teach & Replay) on or off."""
+    try:
+        return jsonify(_http_json(f"{MODULE1_URL}/api/dual", request.get_json(silent=True) or {}, timeout=5.0))
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": "restart Module 1 to use this" if e.code == 404 else f"HTTP {e.code}"}), 409
+    except OSError:
+        return jsonify({"error": "Module 1 is not running (or is still starting)"}), 409
 
 
 @app.route("/api/service/<name>/log")

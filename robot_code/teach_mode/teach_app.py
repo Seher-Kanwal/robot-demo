@@ -22,7 +22,12 @@ Usage (one process owns the RealSense, so stop robot_web_app.py first):
 
     # teach and replay side by side: a second, explore-mode view of the same camera frames and
     # the same memory at /recognize, so an object is recognized there right after it's taught
+    # (also switchable at runtime: POST /api/dual {"on": true})
     .venv/Scripts/python.exe robot_code/teach_mode/teach_app.py --dual-view
+
+    # load the models but leave the RealSense free until POST /api/camera {"on": true} -- the
+    # hub hands the camera between Module 1 and Module 2 this way instead of restarting them
+    .venv/Scripts/python.exe robot_code/teach_mode/teach_app.py --camera-off
 
 Memory lives in robot_code/teach_mode/teach_memory/ (memory.json + view JPGs); delete that
 folder to start from scratch, or use the Memory card on the page to edit it live.
@@ -61,9 +66,12 @@ PERSON_CLASS_ID = 0  # VOC_NAME_MAPPING[0]
 app = Flask(__name__)
 ARGS = None
 TEACHER = None
-EXPLORER = None  # --dual-view: a second Teacher in explore mode on the same frames and memory
+EXPLORER = None  # a second Teacher in explore mode on the same frames and memory (the /recognize view)
+DUAL_ON = threading.Event()  # EXPLORER runs only while set (--dual-view, POST /api/dual)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOOP = {"running": False, "error": None, "source": None}
+# camera: "off" (RealSense released, models stay loaded), "opening" or "on"; see CAMERA_ON
+LOOP = {"running": False, "error": None, "source": None, "camera": "off"}
+CAMERA_ON = threading.Event()  # cleared by POST /api/camera {"on": false}: the loop lets go of the camera
 
 
 class FrameHub:
@@ -130,15 +138,28 @@ def frame_source():
 
 
 def live_loop(predictor):
+    """Runs forever: holds the camera while CAMERA_ON is set and lets go of it (closing the
+    RealSense) when it's cleared, so another module can use it without this one reloading
+    its models. A camera error also lets go; switching the camera on again retries."""
+    while True:
+        CAMERA_ON.wait()
+        _run_camera(predictor)
+
+
+def _run_camera(predictor):
     recorder = None
     t_prev = time.perf_counter()
+    frames = frame_source()
     try:
-        LOOP["running"] = True
-        for im0, _is_last in frame_source():
+        LOOP.update(running=True, camera="opening", error=None)
+        for im0, _is_last in frames:
+            if not CAMERA_ON.is_set():
+                break
+            LOOP["camera"] = "on"
             boxes, labels, scores = detect(predictor, im0)
             robot, ood = TEACHER.process(im0, boxes, labels, scores)
             recognize_jpg = None
-            if EXPLORER is not None:
+            if DUAL_ON.is_set():
                 recognize, _ood = EXPLORER.process(im0, boxes, labels, scores)
                 recognize_jpg = encode_jpg(recognize, max_dim=1280, quality=80)
             FRAMES.publish(encode_jpg(robot, max_dim=1280, quality=80), encode_jpg(ood, max_dim=1280, quality=80),
@@ -151,15 +172,18 @@ def live_loop(predictor):
             t = time.perf_counter()
             inst_fps = 1.0 / max(t - t_prev, 1e-6)
             TEACHER.fps = inst_fps if not TEACHER.fps else 0.9 * TEACHER.fps + 0.1 * inst_fps
-            if EXPLORER is not None:
-                EXPLORER.fps = TEACHER.fps
+            EXPLORER.fps = TEACHER.fps
             t_prev = t
-        print("[teach_app] source ended")
+        else:
+            print("[teach_app] source ended")
+            CAMERA_ON.clear()
     except Exception as e:
         print(f"[teach_app] camera loop stopped: {e!r}")
         LOOP["error"] = str(e)
+        CAMERA_ON.clear()
     finally:
-        LOOP["running"] = False
+        frames.close()  # closes the RealSense pipeline
+        LOOP.update(running=False, camera="off")
         if recorder is not None:
             recorder.release()
 
@@ -181,7 +205,7 @@ def recognize_page():
 
 @app.route("/stream/<which>.mjpg")
 def stream(which):
-    if which not in ("robot", "ood", "recognize") or (which == "recognize" and EXPLORER is None):
+    if which not in ("robot", "ood", "recognize"):
         return _err("unknown stream", 404)
     return Response(FRAMES.stream(which), mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-store"})
@@ -192,15 +216,42 @@ def api_state():
     since = request.args.get("since", default=0, type=int)
     snap = TEACHER.snapshot(since)
     snap.update({"ready": snap["frame_count"] > 0, "running": LOOP["running"], "error": LOOP["error"],
-                 "source": LOOP["source"], "dual_view": EXPLORER is not None})
+                 "source": LOOP["source"], "dual_view": DUAL_ON.is_set(), "camera": LOOP["camera"]})
     return jsonify(snap)
+
+
+@app.route("/api/camera", methods=["GET", "POST"])
+def api_camera():
+    """{"on": bool}: take or release the camera, models stay loaded. Releasing answers once the
+    RealSense is closed, so the caller can hand it to another module right away."""
+    if request.method == "POST":
+        if (request.get_json(silent=True) or {}).get("on"):
+            CAMERA_ON.set()
+        else:
+            CAMERA_ON.clear()
+            deadline = time.monotonic() + 5.0
+            while LOOP["camera"] != "off" and time.monotonic() < deadline:
+                time.sleep(0.05)
+    return jsonify({"camera": LOOP["camera"], "wanted": CAMERA_ON.is_set(), "error": LOOP["error"]})
+
+
+@app.route("/api/dual", methods=["POST"])
+def api_dual():
+    """{"on": bool}: the explore-mode /recognize view next to teaching (Teach & Replay)."""
+    if (request.get_json(silent=True) or {}).get("on"):
+        if not DUAL_ON.is_set():
+            EXPLORER.memory_swapped()  # announce every remembered object again
+        DUAL_ON.set()
+    else:
+        DUAL_ON.clear()
+    return jsonify({"ok": True, "dual_view": DUAL_ON.is_set()})
 
 
 @app.route("/api/recognize/state")
 def api_recognize_state():
     """The --dual-view explore side, same shape as /api/state."""
-    if EXPLORER is None:
-        return _err("start teach_app.py with --dual-view for the side-by-side recognize view", 404)
+    if not DUAL_ON.is_set():
+        return _err("the recognize view is off -- use the hub's Teach & Replay button", 409)
     since = request.args.get("since", default=0, type=int)
     snap = EXPLORER.snapshot(since)
     snap.update({"ready": snap["frame_count"] > 0, "running": LOOP["running"], "error": LOOP["error"],
@@ -367,7 +418,9 @@ def parse_args():
                       help="explore mode: min detector score for an OOD box to be shown (if memory names it)")
     mode.add_argument("--dual-view", action="store_true",
                       help="also run an explore-mode view of the same frames and memory, shown at /recognize "
-                           "(teach and replay side by side)")
+                           "(teach and replay side by side; also switchable with POST /api/dual)")
+    src.add_argument("--camera-off", action="store_true",
+                     help="load everything but don't open the camera until POST /api/camera {\"on\": true}")
 
     mem = p.add_argument_group("memory (steps 5, 7)")
     mem.add_argument("--memory-dir", type=str, default=str(TEACH_DIR / "teach_memory"))
@@ -417,14 +470,17 @@ def main():
         capture_acquire_sim=ARGS.capture_acquire_sim, show_scores=ARGS.show_scores,
         mode=ARGS.mode, explore_ood_conf=ARGS.explore_ood_conf,
     )
+    # Its own tracker, so it never shares the teach side's question state; it never asks anyway.
+    EXPLORER = Teacher(
+        embedder, memory, UnknownTracker(same_thres=ARGS.same_thres), ri.VOC_NAME_MAPPING, ri.OOD_CLASS_ID,
+        person_class_id=PERSON_CLASS_ID, match_known_boxes=ARGS.match_known_boxes, show_scores=ARGS.show_scores,
+        mode="explore", explore_ood_conf=ARGS.explore_ood_conf,
+    )
     if ARGS.dual_view:
-        # Its own tracker, so it never shares the teach side's question state; it never asks anyway.
-        EXPLORER = Teacher(
-            embedder, memory, UnknownTracker(same_thres=ARGS.same_thres), ri.VOC_NAME_MAPPING, ri.OOD_CLASS_ID,
-            person_class_id=PERSON_CLASS_ID, match_known_boxes=ARGS.match_known_boxes, show_scores=ARGS.show_scores,
-            mode="explore", explore_ood_conf=ARGS.explore_ood_conf,
-        )
+        DUAL_ON.set()
         print(f"[teach_app] dual view: recognize side at http://{ARGS.host}:{ARGS.port}/recognize")
+    if not ARGS.camera_off:
+        CAMERA_ON.set()
     threading.Thread(target=live_loop, args=(predictor,), daemon=True).start()
     print(f"[teach_app] open http://{ARGS.host}:{ARGS.port}/ in Chrome or Edge")
     app.run(host=ARGS.host, port=ARGS.port, debug=False, use_reloader=False, threaded=True)

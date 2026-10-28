@@ -8,6 +8,7 @@ a ROS topic) -- not torch/detectron2/the rest of the detector stack, which only 
 workstation needs. robot_implementation.py re-exports everything here, so existing
 `ri.iter_frames` / `ri.realsense_iter_frames` callers keep working unchanged.
 """
+import os
 import time
 from pathlib import Path
 
@@ -99,6 +100,107 @@ def _start_realsense(rs, serial, width, height, fps, with_depth, wait_s=30.0, re
         time.sleep(retry_every_s)
 
 
+def _equirect_to_view_maps(src_w, src_h, out_w, out_h, fov_deg, yaw_deg, pitch_deg):
+    """cv2.remap maps that cut a normal (pinhole) view out of an equirectangular panorama.
+    fov_deg is the view's horizontal field of view; yaw_deg turns it right of the panorama's
+    centre, pitch_deg tilts it up."""
+    f = 0.5 * out_w / np.tan(np.radians(fov_deg) / 2)
+    xx, yy = np.meshgrid(np.arange(out_w) - (out_w - 1) / 2, np.arange(out_h) - (out_h - 1) / 2)
+    rays = np.stack([xx, yy, np.full_like(xx, f)], axis=-1)  # x right, y down, z forward
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    p, y = np.radians(pitch_deg), np.radians(yaw_deg)
+    rot_pitch = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    rot_yaw = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    rays = rays @ (rot_yaw @ rot_pitch).T
+    lon = np.arctan2(rays[..., 0], rays[..., 2])  # 0 = panorama centre
+    lat = np.arcsin(np.clip(rays[..., 1], -1, 1))  # positive = down
+    map_x = ((lon / (2 * np.pi) + 0.5) * src_w).astype(np.float32)
+    map_y = ((lat / np.pi + 0.5) * src_h).astype(np.float32)
+    return map_x, map_y
+
+
+def _open_theta(width, height, wait_s=30.0, retry_every_s=2.0):
+    """Opens the RICOH THETA's UVC stream (live mode + the RICOH THETA UVC driver). OpenCV
+    can't list camera names, so it takes the first camera index (or THETA_INDEX) that gives
+    a 2:1 equirectangular frame. Retries for up to wait_s, like _start_realsense()."""
+    indices = [int(os.environ["THETA_INDEX"])] if os.environ.get("THETA_INDEX") else range(6)
+    deadline = time.monotonic() + wait_s
+    while True:
+        for i in indices:
+            cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.shape[1] == 2 * frame.shape[0]:
+                    return cap, i
+            cap.release()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("no RICOH THETA found -- is it plugged in, switched to LIVE mode, and is the "
+                               "RICOH THETA UVC driver installed?")
+        print(f"[theta] camera not found or busy, retrying in {retry_every_s:.0f} s ...")
+        time.sleep(retry_every_s)
+
+
+def theta_iter_frames(width=1280, height=720, with_depth=False):
+    """Yields (im0, False) pairs from a USB RICOH THETA (Z1/V/X): only the front view, cut out
+    of its 360-degree panorama at the RealSense's resolution, so nothing downstream can tell
+    the difference. The view can be aimed with the THETA_YAW / THETA_PITCH env vars (degrees,
+    default 0 = the panorama's centre) and widened with THETA_FOV (horizontal degrees, default
+    90). The THETA has no depth: with_depth=True yields (im0, False, None). Like the other
+    live sources, always hands the caller the newest frame."""
+    import queue
+    import threading
+
+    fov = float(os.environ.get("THETA_FOV", 90))
+    yaw = float(os.environ.get("THETA_YAW", 0))
+    pitch = float(os.environ.get("THETA_PITCH", 0))
+    cap, index = _open_theta(3840, 1920)
+    src_h, src_w = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    map_x, map_y = _equirect_to_view_maps(src_w, src_h, width, height, fov, yaw, pitch)
+    print(f"[theta] streaming {src_w}x{src_h} panorama from camera index {index}; front view "
+          f"{width}x{height}, fov {fov:g}, yaw {yaw:g}, pitch {pitch:g}")
+
+    frame_q = queue.Queue(maxsize=1)
+    stopped = threading.Event()
+
+    def _reader():
+        while not stopped.is_set():
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                frame_q.put(None)
+                return
+            if frame_q.full():
+                try:
+                    frame_q.get_nowait()  # drop the stale frame; keep only the newest
+                except queue.Empty:
+                    pass
+            frame_q.put(frame)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        while True:
+            frame = frame_q.get()
+            if frame is None:
+                raise RuntimeError("the THETA stopped sending frames")
+            im0 = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+            yield (im0, False, None) if with_depth else (im0, False)
+    finally:
+        stopped.set()
+        cap.release()
+
+
+def _use_theta(serial):
+    """--realsense theta picks the THETA; with no serial, it's used when no RealSense is plugged in."""
+    if serial:
+        return serial.lower() == "theta"
+    try:
+        import pyrealsense2 as rs
+    except ImportError:
+        return True
+    return len(rs.context().query_devices()) == 0
+
+
 def realsense_iter_frames(serial=None, width=1280, height=720, fps=30, with_depth=False):
     """Yields (im0, False) pairs straight from a USB-attached Intel RealSense (D4xx) color
     stream via pyrealsense2 -- no ROS/realsense-ros needed. `serial` picks one camera when
@@ -108,7 +210,13 @@ def realsense_iter_frames(serial=None, width=1280, height=720, fps=30, with_dept
 
     with_depth=True yields (im0, False, depth_info) triples instead, where depth_info is
     {"depth_mm": uint16 HxW depth aligned to im0 (millimetres, 0 = no reading),
-     "fx", "fy", "cx", "cy": the color camera's intrinsics in im0 pixels}."""
+     "fx", "fy", "cx", "cy": the color camera's intrinsics in im0 pixels}.
+
+    With no RealSense plugged in (or serial "theta") this streams the front view of a RICOH
+    THETA instead; see theta_iter_frames()."""
+    if _use_theta(serial):
+        yield from theta_iter_frames(width, height, with_depth)
+        return
     import pyrealsense2 as rs
 
     pipeline, profile, depth_size = _start_realsense(rs, serial, width, height, fps, with_depth)

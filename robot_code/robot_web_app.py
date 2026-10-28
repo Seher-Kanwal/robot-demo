@@ -29,6 +29,10 @@ the ms/frame the page shows for each is that path's own compute time. Run on its
 
 The live view stops on a frame that still has objects nobody could name, until each one is
 named or dismissed on the page (--no-freeze to keep streaming).
+
+Part 3 of the demo, "OOD + memory + OED" (http://<host>:<port>/hybrid, hybrid_pipeline.py),
+also runs here: OOD boxes are looked up in Module 1's taught memory first, and only the rest go
+to the VLM. It replaces the Module 2 pipeline on the live feed while that page is open.
 """
 import argparse
 import base64
@@ -62,6 +66,7 @@ import robot_assistant  # noqa: E402
 PAGE_PATH = FILE.parent / "live_feed_demo.html"
 ASSISTANT_PAGE_PATH = FILE.parent / "robot_assistant.html"
 MODULE3_PAGE_PATH = FILE.parent / "qwen_direct.html"
+HYBRID_PAGE_PATH = FILE.parent / "hybrid_pipeline.html"
 
 # Curated set of repo-root images that make decent demo material; anything
 # missing is silently skipped so this doesn't break if the repo changes.
@@ -172,9 +177,19 @@ LIVE_UNKNOWN = OrderedDict()
 # pass always works on what the camera sees *now*, never on a frame that sat waiting while
 # the other path (or the previous several-second Qwen pass) had the GPU. A generator can't
 # be entered from two threads at once, hence FRAME_LOCK. FRAME_SEQ counts frames grabbed.
+# The iterator is opened on first use and closed again while the camera is switched off
+# (POST /api/camera, see release_camera), so the hub can hand the RealSense to Module 1
+# without this server reloading its models. LIVE_FRAMES_FACTORY opens a fresh one.
 LIVE_FRAMES = None
+LIVE_FRAMES_FACTORY = None
 FRAME_LOCK = threading.Lock()
 FRAME_SEQ = 0
+CAMERA_ON = threading.Event()
+CAMERA = {"state": "off"}  # "off" (released), "opening" or "on"
+
+
+class CameraPaused(RuntimeError):
+    """grab_frame() while the camera is switched off; the live loops wait for it to come back."""
 # Module 3 on its own: how often live_loop refreshes the plain camera picture the page shows
 # (it polls once a second). Grabbing + JPEG-encoding every camera frame instead only steals
 # CPU/GIL time from the Qwen pass's token-by-token generate() loop.
@@ -208,6 +223,29 @@ QWEN_LIVE_STATE = {
     "labels": [], "count": 0, "timing": None, "raw_text": "", "runs": 0, "model_id": None,
     "session": 0,
 }
+
+# --- Part 3: OOD + memory + VLM (/hybrid page, hybrid_pipeline.py) ---------------
+# While the /hybrid page is open, live_loop runs hybrid_step() instead of the Module 2 pipeline:
+# every OOD box is looked up in Module 1's memory first, and only what memory can't name goes
+# to the VLM. The page switches it on when it opens and off when it closes; a page that vanished
+# without saying so (a crashed tab) switches it off by not polling for HYBRID_TIMEOUT_S.
+HYBRID_TIMEOUT_S = 8.0
+HYBRID_LOCK = threading.Lock()
+HYBRID = {"enabled": False, "last_poll": 0.0, "fps": None, "last_t": None}
+HYBRID_STATE = {"ready": False, "error": None, "warming": None, "seq": 0, "frame_count": 0, "totals": None}
+HYBRID_PIPELINE = None  # hybrid_pipeline.HybridPipeline, built on first use (loads the DINOv2 embedder)
+CACHE_HYBRID = OrderedDict()  # the VLM's spatial cache for this path, like CACHE_LIVE
+
+
+def hybrid_totals():
+    return {"frames": 0, "ood": 0, "memory": 0, "vlm": 0, "vlm_new": 0, "unknown": 0,
+            "detect_ms": 0.0, "memory_ms": 0.0, "vlm_ms": 0.0}
+
+
+def hybrid_active():
+    with HYBRID_LOCK:
+        return HYBRID["enabled"] and time.time() - HYBRID["last_poll"] < HYBRID_TIMEOUT_S
+
 
 # --- OOD + VLM vs VLM-only results (the page's "Comparison results" panel) --------
 # One row per finished frame of either method: the live pipeline (live_loop), the live
@@ -263,8 +301,17 @@ def compare_summary():
 # Fed every processed frame from both live paths (live_loop and robot_client.py pushes)
 # via assistant_observe(); answers "where are my X?" from them. Set in main().
 ASSISTANT = None
+# When the /assistant page last polled. While it's open the live view must keep moving
+# (the user turns the robot to new views to search), so the live loop doesn't stop on
+# unnamed objects then -- nobody on that page is there to name them. See assistant_active().
+ASSISTANT_TIMEOUT_S = 8.0
+ASSISTANT_POLL = {"last": 0.0}
 # Last downscaled grayscale frame per live path, for flush_cache_on_motion().
 MOTION_PREV = {}
+
+
+def assistant_active():
+    return time.time() - ASSISTANT_POLL["last"] < ASSISTANT_TIMEOUT_S
 
 
 def flush_cache_on_motion(name, im0, cache):
@@ -490,16 +537,40 @@ def qwen_direct_model_id():
 
 
 def grab_frame():
-    """The live source's newest frame, as (im0, depth_info, seq). Thread-safe; see LIVE_FRAMES."""
-    global FRAME_SEQ
+    """The live source's newest frame, as (im0, depth_info, seq). Thread-safe; see LIVE_FRAMES.
+    Opens the camera if needed; raises CameraPaused while it's switched off."""
+    global FRAME_SEQ, LIVE_FRAMES
     with FRAME_LOCK:
-        item = next(LIVE_FRAMES, None)
+        if not CAMERA_ON.is_set():
+            raise CameraPaused("the camera is switched off")
+        if LIVE_FRAMES is None:
+            CAMERA["state"] = "opening"
+            LIVE_FRAMES = LIVE_FRAMES_FACTORY()
+        try:
+            item = next(LIVE_FRAMES, None)
+        except Exception:
+            LIVE_FRAMES = None  # a generator that raised is finished; the next grab reopens
+            CAMERA["state"] = "off"
+            raise
         if item is None:
+            LIVE_FRAMES = None
             raise RuntimeError("the camera stream ended")
+        CAMERA["state"] = "on"
         FRAME_SEQ += 1
         seq = FRAME_SEQ
     # (im0, is_last), or (im0, is_last, depth_info) from realsense_iter_frames(with_depth=True)
     return item[0], (item[2] if len(item) > 2 else None), seq
+
+
+def release_camera():
+    """Switches the camera off and closes the RealSense (once no grab is in progress)."""
+    global LIVE_FRAMES
+    CAMERA_ON.clear()
+    with FRAME_LOCK:
+        if LIVE_FRAMES is not None:
+            LIVE_FRAMES.close()  # runs the generator's finally: pipeline.stop()
+            LIVE_FRAMES = None
+        CAMERA["state"] = "off"
 
 
 def qwen_direct_infer(im0):
@@ -569,6 +640,9 @@ def qwen_live_loop():
                 im0, _depth, frame_count = grab_frame()
                 detections, raw_text, infer_ms = qwen_direct_infer(im0)
             image = encode_jpg(annotate_qwen_direct(im0.copy(), detections))
+        except CameraPaused:
+            time.sleep(0.2)
+            continue
         except Exception as e:
             print(f"[robot_web_app] qwen-direct live loop error: {e}")
             QWEN_LIVE_ENABLED.clear()
@@ -592,12 +666,21 @@ def qwen_live_loop():
 
 
 def live_loop():
-    """Runs forever on a background thread: grabs frames from the live source (a ROS 2 topic
-    via ri.ros_iter_frames, or a USB RealSense via ri.realsense_iter_frames; see grab_frame),
-    runs the real pipeline (batched, unlike label_ood_detections_timed above) with stage 3
-    disabled, and publishes each result into LIVE_STATE. Never raises into the caller
-    -- on error it records the message into LIVE_STATE['error'] and stops, so a camera
-    hiccup surfaces on the page instead of silently killing the server.
+    """Runs forever: _run_live_loop() while the camera is switched on (CAMERA_ON). A camera
+    error switches it off (and frees the device) instead of ending the thread for good."""
+    while True:
+        CAMERA_ON.wait()
+        _run_live_loop()
+
+
+def _run_live_loop():
+    """Runs on the live loop's thread until the camera is switched off: grabs frames from the
+    live source (a ROS 2 topic via ri.ros_iter_frames, or a USB RealSense via
+    ri.realsense_iter_frames; see grab_frame), runs the real pipeline (batched, unlike
+    label_ood_detections_timed above) with stage 3 disabled, and publishes each result into
+    LIVE_STATE. Never raises into the caller -- on error it records the message into
+    LIVE_STATE['error'] and switches the camera off, so a camera hiccup surfaces on the page
+    instead of silently killing the server.
 
     Stops on a frame that still has unnamed objects (see LIVE_FROZEN), and runs no pipeline at
     all while Module 3 has the camera to itself (QWEN_SOLO) -- then it only refreshes the
@@ -617,8 +700,20 @@ def live_loop():
                                        "resolution": f"{im0.shape[1]}x{im0.shape[0]}"})
                 time.sleep(SOLO_PREVIEW_INTERVAL)
                 continue
+            if hybrid_active():  # Part 3 instead of Module 2 (a stopped frame waits meanwhile)
+                hybrid_step(predictor)
+                continue
             with LIVE_LOCK:
                 stopped = LIVE_FROZEN is not None
+                if stopped and assistant_active():
+                    # Go live again for the /assistant page; the unnamed objects stay on the
+                    # operator view's list (LIVE_UNKNOWN) to be named later.
+                    for key, item in LIVE_FROZEN["pending"].items():
+                        LIVE_UNKNOWN[key] = item
+                        LIVE_UNKNOWN.move_to_end(key)
+                    LIVE_FROZEN = None
+                    LIVE_STATE.update({"frozen": False, "pending": list(LIVE_UNKNOWN.values())})
+                    stopped = False
             if stopped:
                 time.sleep(0.05)
                 continue
@@ -687,7 +782,7 @@ def live_loop():
             # comparison with only one side moving (unknowns still collect in LIVE_UNKNOWN).
             comparing = QWEN_LIVE_ENABLED.is_set() and not QWEN_SOLO.is_set()
             with LIVE_LOCK:
-                if seen_unknown and not ARGS.no_freeze and not comparing:
+                if seen_unknown and not ARGS.no_freeze and not comparing and not assistant_active():
                     # Stop on this frame: the page keeps showing it, and asks about exactly these
                     # objects, until every one is named or dismissed (api_live_label).
                     LIVE_FROZEN = {
@@ -720,10 +815,67 @@ def live_loop():
             compare_log("live", "pipeline", LIVE_SOURCE, seq, frame_ms, stats["total"],
                         pipeline_label_names(known_labels, resolved_labels))
             assistant_observe(im0, boxes, labels, scores, ood_labels_by_row, preview_b64, depth_info, LIVE_SOURCE)
+    except CameraPaused:
+        return
     except Exception as e:
         print(f"[robot_web_app] live loop stopped: {e}")
         with LIVE_LOCK:
             LIVE_STATE["error"] = str(e)
+        release_camera()  # switching it on again (hub / POST /api/camera) retries
+
+
+def hybrid_step(predictor):
+    """One frame of Part 3 (see HYBRID): detector + energy OOD split, then hybrid_pipeline does
+    memory first and the VLM for the rest. Camera errors propagate to _run_live_loop; a failure
+    of Part 3 itself only switches Part 3 off, with the message on its page."""
+    global HYBRID_PIPELINE
+    with GPU_LOCK:
+        im0, depth_info, seq = grab_frame()
+        try:
+            if HYBRID_PIPELINE is None:
+                with HYBRID_LOCK:
+                    HYBRID_STATE["warming"] = "loading Module 1's memory and its embedder (DINOv2)…"
+                import hybrid_pipeline
+                memory = hybrid_pipeline.TaughtMemory(ARGS.hybrid_memory_dir, device=str(DEVICE),
+                                                      accept_thres=ARGS.hybrid_accept_thres)
+                HYBRID_PIPELINE = hybrid_pipeline.HybridPipeline(memory, ARGS.verify_model_id)
+            t0 = time.perf_counter()
+            image_tensor, letterboxed_shape = ri.preprocess(im0)
+            with torch.no_grad():
+                results = ri.run_inference(predictor, image_tensor, letterboxed_shape)
+            boxes, labels, scores = ri.postprocess_energy(results, ARGS.energy_thres, ARGS.conf_thres)
+            if len(boxes):
+                boxes = ri.scale_boxes(letterboxed_shape, boxes, im0.shape).round()
+            detect_ms = (time.perf_counter() - t0) * 1000
+            flush_cache_on_motion("hybrid", im0, CACHE_HYBRID)
+            result, ood_labels_by_row = HYBRID_PIPELINE.run(
+                im0, boxes, labels, scores, CACHE_HYBRID,
+                lambda img, max_dim: encode_jpg(img, max_dim=max_dim, quality=82))
+        except Exception as e:
+            print(f"[robot_web_app] Part 3 (OOD + memory + VLM) stopped: {e}")
+            with HYBRID_LOCK:
+                HYBRID["enabled"] = False
+                HYBRID_STATE.update(error=str(e), warming=None)
+            return
+    timing = {"detect_ms": round(detect_ms, 1), **result["timing"]}
+    timing["frame_ms"] = round(timing["detect_ms"] + timing["memory_ms"] + timing["vlm_ms"], 1)
+    now = time.perf_counter()
+    with HYBRID_LOCK:
+        HYBRID["fps"] = update_fps(HYBRID["fps"], HYBRID["last_t"], now)
+        HYBRID["last_t"] = now
+        timing["fps"] = round(HYBRID["fps"], 2) if HYBRID["fps"] else None
+        tot = HYBRID_STATE["totals"] or hybrid_totals()
+        c = result["counts"]
+        tot["frames"] += 1
+        for k in ("ood", "memory", "vlm", "vlm_new", "unknown"):
+            tot[k] += c[k]
+        for k in ("detect_ms", "memory_ms", "vlm_ms"):
+            tot[k] += timing[k]
+        HYBRID_STATE.update(result)
+        HYBRID_STATE.update({"ready": True, "error": None, "warming": None, "seq": seq, "totals": tot,
+                             "frame_count": HYBRID_STATE["frame_count"] + 1, "timing": timing,
+                             "resolution": f"{im0.shape[1]}x{im0.shape[0]}"})
+    assistant_observe(im0, boxes, labels, scores, ood_labels_by_row, result["images"]["final"], depth_info, LIVE_SOURCE)
 
 
 @app.route("/")
@@ -750,6 +902,22 @@ def api_live_status():
     })
 
 
+@app.route("/api/camera", methods=["GET", "POST"])
+def api_camera():
+    """{"on": bool}: take or release the camera, models stay loaded. Releasing answers once the
+    RealSense is closed, so the caller can hand it to another module right away."""
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
+    if request.method == "POST":
+        if (request.get_json(silent=True) or {}).get("on"):
+            with LIVE_LOCK:
+                LIVE_STATE["error"] = None
+            CAMERA_ON.set()
+        else:
+            release_camera()
+    return jsonify({"camera": CAMERA["state"], "wanted": CAMERA_ON.is_set()})
+
+
 @app.route("/api/live/latest")
 def api_live_latest():
     if LIVE_SOURCE is None:
@@ -759,8 +927,9 @@ def api_live_latest():
     if snapshot["error"]:
         return jsonify({"error": snapshot["error"]}), 500
     if not snapshot["ready"]:
-        return jsonify({"ready": False})
+        return jsonify({"ready": False, "camera": CAMERA["state"]})
     snapshot["energy_thres"] = ARGS.energy_thres
+    snapshot["camera"] = CAMERA["state"]
     return jsonify(snapshot)
 
 
@@ -920,6 +1089,7 @@ def api_assistant_ask():
 
 @app.route("/api/assistant/state")
 def api_assistant_state():
+    ASSISTANT_POLL["last"] = time.time()
     return jsonify(ASSISTANT.state(request.args.get("since", default=0, type=int)))
 
 
@@ -1068,6 +1238,70 @@ def api_qwen_direct_live_latest():
         snapshot.pop("image", None)
         snapshot.pop("raw_text", None)
     return jsonify(snapshot)
+
+
+@app.route("/hybrid")
+def hybrid_page():
+    """Part 3's page: OOD detection, then Module 1's memory, then the VLM for the rest."""
+    return send_from_directory(HYBRID_PAGE_PATH.parent, HYBRID_PAGE_PATH.name)
+
+
+@app.route("/api/hybrid", methods=["POST"])
+def api_hybrid():
+    """{"enabled": bool}: the /hybrid page switches Part 3 on when it opens and off when it
+    closes (navigator.sendBeacon, so the body may come as text/plain). {"reset": true} starts
+    the session totals over."""
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
+    payload = request.get_json(silent=True, force=True) or {}
+    with HYBRID_LOCK:
+        if payload.get("reset"):
+            HYBRID_STATE["totals"] = hybrid_totals()
+        if "enabled" in payload:
+            if payload["enabled"] and not HYBRID["enabled"]:
+                HYBRID.update(fps=None, last_t=None)
+                HYBRID_STATE.update(error=None, totals=hybrid_totals())
+            HYBRID["enabled"] = bool(payload["enabled"])
+            HYBRID["last_poll"] = time.time()
+    if payload.get("enabled"):
+        # Part 3 has the pipeline to itself: Module 3 and the side-by-side comparison stop.
+        QWEN_SOLO.clear()
+        QWEN_LIVE_ENABLED.clear()
+    return jsonify({"enabled": HYBRID["enabled"]})
+
+
+@app.route("/api/hybrid/latest")
+def api_hybrid_latest():
+    """Polled by the /hybrid page, which also keeps Part 3 switched on (see HYBRID_TIMEOUT_S).
+    ?since=<seq>: if that is still the newest frame, leaves out the images and objects."""
+    if LIVE_SOURCE is None:
+        return jsonify({"error": "server was not started with --ros-topic or --realsense"}), 400
+    since = request.args.get("since", default=-1, type=int)
+    with HYBRID_LOCK:
+        if HYBRID["enabled"]:
+            HYBRID["last_poll"] = time.time()
+        snapshot = dict(HYBRID_STATE)
+        enabled = HYBRID["enabled"]
+    if snapshot["seq"] == since:
+        for k in ("images", "objects", "known"):
+            snapshot.pop(k, None)
+        snapshot["unchanged"] = True
+    snapshot.update(enabled=enabled, camera=CAMERA["state"], module3=QWEN_SOLO.is_set(),
+                    energy_thres=ARGS.energy_thres, conf_thres=ARGS.conf_thres, source=LIVE_SOURCE,
+                    vlm_model=os.environ.get("QWEN_MODEL_ID"), verify_model=ARGS.verify_model_id)
+    return jsonify(snapshot)
+
+
+@app.route("/api/hybrid/memory")
+def api_hybrid_memory():
+    """The objects of Module 1's memory, as Part 3 last read it (one view each, for the page)."""
+    mem = HYBRID_PIPELINE.memory if HYBRID_PIPELINE is not None else None
+    return jsonify({"version": mem.version if mem else 0, "objects": mem.objects() if mem else []})
+
+
+@app.route("/api/hybrid/memory/view/<path:file>")
+def api_hybrid_memory_view(file):
+    return send_from_directory(ARGS.hybrid_memory_dir, file)
 
 
 @app.route("/api/compare/metrics")
@@ -1342,6 +1576,9 @@ def parse_args():
                         help="generation budget for one Qwen-direct grounding reply (~25 tokens "
                              "per object found); output cut off at this limit still keeps "
                              "every complete box")
+    parser.add_argument("--camera-off", action="store_true",
+                        help="with --realsense: load everything but don't open the camera until "
+                             "POST /api/camera {\"on\": true} (the hub hands it between modules this way)")
     parser.add_argument("--depth", action="store_true",
                         help="with --realsense: also stream aligned depth, so the /assistant page can say "
                              "how far away and in which direction a found object is. (For a RealSense on "
@@ -1354,15 +1591,21 @@ def parse_args():
     parser.add_argument("--no-grounding", action="store_true",
                         help="/assistant: don't fall back to asking Qwen3-VL to find an object in the "
                              "whole frame when the detector hasn't seen it")
+    parser.add_argument("--hybrid-memory-dir", type=str, default=str(FILE.parent / "teach_mode" / "teach_memory"),
+                        help="/hybrid (Part 3): Module 1's memory folder, only read here (default: Module 1's "
+                             "default --memory-dir)")
+    parser.add_argument("--hybrid-accept-thres", type=float, default=0.62,
+                        help="/hybrid: memory match threshold, the same as Module 1's --accept-thres")
     return parser.parse_args()
 
 
 def main():
-    global ARGS, MEMORY, LIVE_SOURCE, ASSISTANT, LIVE_FRAMES
+    global ARGS, MEMORY, LIVE_SOURCE, ASSISTANT, LIVE_FRAMES_FACTORY
     ARGS = parse_args()
     MEMORY = None if ARGS.no_memory else ood_memory.OODMemory(ARGS.memory_path, ARGS.memory_sim_thres)
     ASSISTANT = robot_assistant.Assistant(
         voc_names=ri.VOC_NAME_MAPPING, ood_class_id=ri.OOD_CLASS_ID, grounding=not ARGS.no_grounding,
+        gpu_lock=GPU_LOCK,
     )
 
     # See robot_implementation.main() -- same env var, same "must be set before the first
@@ -1396,11 +1639,14 @@ def main():
 
     if ARGS.ros_topic:
         LIVE_SOURCE = f"ROS topic: {ARGS.ros_topic}"
-        LIVE_FRAMES = ri.ros_iter_frames(ARGS.ros_topic, ARGS.ros_qos)
+        LIVE_FRAMES_FACTORY = lambda: ri.ros_iter_frames(ARGS.ros_topic, ARGS.ros_qos)  # noqa: E731
     elif ARGS.realsense is not None:
         LIVE_SOURCE = "RealSense camera" + (f" {ARGS.realsense}" if ARGS.realsense else "")
-        LIVE_FRAMES = ri.realsense_iter_frames(ARGS.realsense or None, with_depth=ARGS.depth)
+        LIVE_FRAMES_FACTORY = lambda: ri.realsense_iter_frames(ARGS.realsense or None,  # noqa: E731
+                                                               with_depth=ARGS.depth)
     if LIVE_SOURCE:
+        if not ARGS.camera_off:
+            CAMERA_ON.set()
         print(f"[robot_web_app] starting live loop on {LIVE_SOURCE} ...")
         threading.Thread(target=live_loop, daemon=True).start()
         # Idle until the page's "Compare with Qwen3-VL direct" toggle sets QWEN_LIVE_ENABLED.

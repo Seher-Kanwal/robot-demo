@@ -222,6 +222,34 @@ demo is presented, in two parts:
    "Run detection" / "Run Qwen direct" on Module 2's full page (`?full=1`).
 4. **Robot assistant**: Module 2's `/assistant` page ("where are my X?").
 
+**Part 3 · OOD + Memory + OED (Part 1's memory in front of Part 2's VLM)**
+1. **OOD + Memory + VLM**: Module 2's `/hybrid` page (`hybrid_pipeline.py` + `.html`).
+   Every OOD box is first matched against Module 1's memory (`teach_mode/teach_memory/`,
+   the same DINOv2 embedder, 0.62 threshold and 0.05 margin as Module 1). Only the boxes
+   memory can't name go to Qwen3-VL (stage 1, then stage 2 if unsure; no human step).
+   The page shows two screens (*OOD detection only* | *OOD + Memory + VLM*), then each of
+   the three steps on its own image, with per-box crops, similarities and VLM sources, plus
+   session totals and the memory gallery. It runs inside the Module 2 server and replaces
+   Module 2's pipeline on the live feed while the page is open. The page turns it on when
+   it opens, and turns it off when it closes or after 8 s without a poll. Module 1's memory
+   is only read here, and it is read again whenever `memory.json` changes, so objects taught
+   in Part 1 are used from the next frame on. Flags: `--hybrid-memory-dir`,
+   `--hybrid-accept-thres`.
+
+**Load all models** (top right) starts Module 1 and Module 2 once, about a minute,
+~13 GB of GPU memory together. After that no scene reloads anything: both modules stay
+loaded, and a scene button only hands the RealSense over (`POST /api/service/<name>/camera`
+on the hub, `/api/camera` on each module, which closes or reopens the camera without
+exiting). A handover takes about 1.5–3 s. Without Load all models, a scene starts the
+module it needs the first time, and keeps it loaded afterwards. Modules can also be started
+loaded but without the camera with `--camera-off`.
+
+A scene button takes the RealSense from whatever else holds it without asking, so going
+from one scene to another is one click. The module pages start by
+themselves; Chrome only lets a page speak after it has been clicked, so Module 1 shows a
+"click anywhere to turn on the robot's voice" bar until then (start Chrome with
+`--autoplay-policy=no-user-gesture-required` should skip even that; not tested here). Each part shows its
+modules' state with a **Stop** button (Part 2's stops Module 3 and Module 2), and
 **Stop everything** (top right) stops all modules and frees the camera and GPU.
 
 Under **Advanced** are one card per service (Module 1, Module 2, Module 3) with their

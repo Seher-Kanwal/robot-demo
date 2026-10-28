@@ -4,13 +4,18 @@ the sofa, next to the teddy bear, about 1.6 m ahead, slightly to my left."
 
 robot_web_app.py calls Assistant.observe() once per processed frame (live --realsense loop
 or robot_client.py pushes) with the detector + VLM results it already computed; nothing
-here runs the detector again. A question is answered by, in order:
+here runs the detector again. A question is answered from the current view first:
 
   1. live      -- the object is in the latest frame: where it is right now (+ depth position)
-  2. memory    -- it was seen earlier: where it was last seen, and how long ago
-  3. grounding -- neither, but Qwen3-VL finds it when asked about the full current frame
-                  (small objects the VOC-trained detector never proposes)
-  4. not found -- keep looking, and say so as soon as it shows up
+  2. grounding -- the detector missed it, but Qwen3-VL finds it when asked about the full
+                  current frame (small objects the VOC-trained detector never proposes)
+  3. memory    -- not in this view, but seen earlier: where it was last seen, and how long ago
+  4. not found -- "I can't see it from here, please turn me somewhere else"
+
+Not found in this view starts a step-by-step search (_search_loop): every time the user
+turns the robot to a *new* view and holds it still, that view is checked the same way
+(detector, then Qwen3-VL), and the robot says either "I found your headphones ..." or
+"not here either, please turn me somewhere else" -- until it's found or cancelled.
 
 Every asked-for object stays on a short watch list afterwards, so the page also gets
 proactive messages: "There they are! I found your headphones on the table." when it
@@ -19,6 +24,7 @@ first appears, and "...they are now on the table" when it moves to a different s
 Only find/locate requests are understood -- the robot itself is driven by hand.
 """
 import base64
+import contextlib
 import re
 import threading
 import time
@@ -35,6 +41,16 @@ MAX_SEARCHES = 3
 EVENT_COOLDOWN_S = 5.0      # per searched object, so a flickering detection can't chatter
 MATCH_THRESHOLD = 0.8
 MAX_EVENTS = 100
+# Step-by-step search: views are compared as 160x90 grayscale thumbnails (mean absolute
+# difference, 0-255 -- same measure as robot_web_app's --motion-flush-thres).
+VIEW_CHANGED_THRES = 12.0   # this far from the view last checked = the user turned me somewhere new
+VIEW_STEADY_THRES = 6.0     # consecutive frames this close = I've stopped turning, so look now
+SEARCH_POLL_S = 0.3
+NOT_HERE_LINES = (
+    "I don't see {obj} here either. Please turn me somewhere else.",
+    "Not here. Can you point me in another direction?",
+    "Still no {target} in this view. Let's try somewhere else.",
+)
 _NUM = r"\s*(-?\d+(?:\.\d+)?)\s*"
 BBOX_RE = re.compile(r"\[" + ",".join([_NUM] * 4) + r"\]")
 
@@ -199,6 +215,14 @@ def _ago(seconds):
     return "an hour ago" if hours == 1 else f"{hours} hours ago"
 
 
+def _thumb(im0):
+    return cv2.cvtColor(cv2.resize(im0, (160, 90), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+
+
+def _view_diff(a, b):
+    return float(cv2.absdiff(a, b).mean())
+
+
 def _where(sighting, with_position=True):
     text = sighting["relation"]["text"]
     if with_position and sighting.get("position"):
@@ -209,10 +233,13 @@ def _where(sighting, with_position=True):
 # --- the assistant ---------------------------------------------------------------
 
 class Assistant:
-    def __init__(self, voc_names, ood_class_id, grounding=True):
+    def __init__(self, voc_names, ood_class_id, grounding=True, gpu_lock=None):
         self.voc_names = voc_names
         self.ood_class_id = ood_class_id
         self.grounding = grounding
+        # robot_web_app's GPU_LOCK, so a grounding pass takes its turn between live frames
+        # instead of slowing the detector + VLM pipeline down mid-frame.
+        self._gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
         self.scene = sm.SceneMemory()
         self._lock = threading.RLock()
         self._latest = None  # newest observed frame; see observe()
@@ -220,6 +247,7 @@ class Assistant:
         self._searches = OrderedDict()  # normalized target -> search state
         self._events = deque(maxlen=MAX_EVENTS)
         self._next_id = 1
+        threading.Thread(target=self._search_loop, daemon=True).start()
 
     # -- per-frame input ---------------------------------------------------------
     def observe(self, im0, boxes, labels, scores, ood_labels_by_row, preview_b64, depth_info=None, source=None):
@@ -239,13 +267,16 @@ class Assistant:
 
         ts = time.time()
         sightings = sm.compute_sightings(objects, im0.shape, depth_info)
+        thumb = _thumb(im0)
         with self._lock:
             self._frame_id += 1
             frame_id = self._frame_id
+            prev = self._latest
             self._latest = {
                 "frame_id": frame_id, "ts": ts, "im0": im0, "depth": depth_info, "objects": objects,
                 "sightings": sightings, "preview": preview_b64, "source": source,
                 "resolution": f"{im0.shape[1]}x{im0.shape[0]}", "im_shape": im0.shape[:2],
+                "thumb": thumb, "motion": _view_diff(thumb, prev["thumb"]) if prev is not None else None,
             }
         self.scene.record(frame_id, ts, im0, sightings)
         with self._lock:
@@ -304,16 +335,79 @@ class Assistant:
             else:
                 search["pending_support"], search["pending_count"] = None, 0
 
-    def _watch(self, q, state, support=None):
+    def _watch(self, q, state, support=None, view=None, highlight=None):
+        """`view`: thumbnail of the frame this answer already checked, so the step-by-step
+        search (_search_loop) waits for a different one. `highlight`: a grounding box to
+        keep drawing on the camera view while it still shows that view (see state())."""
         key = sm.norm_label(q.target)
         self._searches.pop(key, None)
         self._searches[key] = {
             "query": q, "state": state, "support": support, "started": time.time(),
             "hits": deque(maxlen=3), "pending_support": None, "pending_count": 0,
             "last_event": time.time() if state == "tracking" else 0.0,
+            "view": view, "looks": 1 if view is not None else 0, "checking": False, "highlight": highlight,
         }
         while len(self._searches) > MAX_SEARCHES:
             self._searches.popitem(last=False)
+
+    @staticmethod
+    def _highlight(sighting, latest):
+        h, w = latest["im_shape"]
+        x1, y1, x2, y2 = sighting["box"]
+        return {"box": [x1 / w, y1 / h, x2 / w, y2 / h], "label": sighting["display"], "thumb": latest["thumb"]}
+
+    # -- step-by-step search: look, ask to be turned, look again -------------------------
+    def _search_loop(self):
+        while True:
+            time.sleep(SEARCH_POLL_S)
+            try:
+                self._search_step()
+            except Exception as e:  # keep searching after a one-off failure
+                print(f"[assistant] search step failed: {e}")
+
+    def _search_step(self):
+        """Checks one still-searching object against the current view once the user has
+        turned the robot somewhere new (VIEW_CHANGED_THRES) and stopped turning
+        (VIEW_STEADY_THRES), then reports either "found" or "not here, turn me again"."""
+        with self._lock:
+            latest = self._latest
+            if latest is None or time.time() - latest["ts"] > LIVE_MAX_AGE_S:
+                return
+            search = None
+            for s in self._searches.values():
+                if s["state"] != "searching" or s["checking"]:
+                    continue
+                if s["view"] is not None and _view_diff(latest["thumb"], s["view"]) < VIEW_CHANGED_THRES:
+                    continue  # same view I already checked
+                if latest["motion"] is None or latest["motion"] > VIEW_STEADY_THRES:
+                    continue  # still turning; look once the picture holds still
+                search = s
+                break
+            if search is None:
+                return
+            search["checking"] = True
+        q = search["query"]
+        try:
+            sighting = self._best_match(latest["sightings"].values(), q.target)
+            if sighting is None and self.grounding:
+                sighting = self._ground(q.target, latest)
+        finally:
+            with self._lock:
+                search["checking"] = False
+        with self._lock:
+            if self._searches.get(sm.norm_label(q.target)) is not search or search["state"] != "searching":
+                return  # cancelled, asked again, or the detector spotted it meanwhile
+            search["view"] = latest["thumb"]
+            search["looks"] += 1
+            if sighting is not None:
+                there = "There they are!" if q.plural else "There it is!"
+                self._emit("found", search, f"{there} I found {q.obj()} {_where(sighting)}.", sighting)
+                search["state"], search["support"] = "tracking", sighting["relation"]["support"]
+                if sighting["source"] == "grounding":
+                    search["highlight"] = self._highlight(sighting, latest)
+            else:
+                line = NOT_HERE_LINES[(search["looks"] - 2) % len(NOT_HERE_LINES)]
+                self._emit("not_here", search, line.format(obj=q.obj(), target=q.target))
 
     def cancel(self, target=None):
         with self._lock:
@@ -359,41 +453,48 @@ class Assistant:
         match = self._best_match(latest["sightings"].values(), q.target) if fresh else None
         if match is not None:
             with self._lock:
-                self._watch(q, "tracking", match["relation"]["support"])
+                self._watch(q, "tracking", match["relation"]["support"], view=latest["thumb"])
             return self._found(reply, q, "found_live", match, f"I found {q.obj()} {_where(match)}.")
 
-        # 2. Seen earlier?
+        # 2. The detector missed it -- ask the VLM to look for it in the whole current frame.
+        if fresh and self.grounding:
+            sighting = self._ground(q.target, latest)
+            if sighting is not None:
+                with self._lock:
+                    self._watch(q, "tracking", sighting["relation"]["support"],
+                                highlight=self._highlight(sighting, latest))
+                return self._found(reply, q, "found_grounding", sighting,
+                                   f"I think I see {q.obj()} {_where(sighting)}.")
+
+        # Not in this view: from here on, every new view the user turns me to gets checked
+        # (_search_loop), and this one doesn't need checking again.
+        view = latest["thumb"] if fresh else None
+        turn_me = "Please turn me somewhere else and I'll look again."
+
+        # 3. Seen earlier?
         remembered = self._best_match(self.scene.all(), q.target)
         if remembered is not None:
             with self._lock:
-                self._watch(q, "searching")
+                self._watch(q, "searching", view=view)
             ago = _ago(now - remembered["ts"])
-            lead = f"I don't see {q.them()} right now, but " if fresh else ""
+            lead = f"I can't see {q.them()} from here, but " if fresh else ""
             text = (f"{lead}I last saw {q.obj()} {_where(remembered, with_position=False)}, {ago}. "
-                    f"I'll tell you when I see {q.them()} again.")
+                    f"{turn_me}")
             reply = self._found(reply, q, "found_memory", remembered, text[0].upper() + text[1:])
             reply["searching"] = True
             reply["age_s"] = round(now - remembered["ts"], 1)
             return reply
 
-        # 3. Ask the VLM to look for it in the whole current frame.
-        if fresh and self.grounding:
-            sighting = self._ground(q.target, latest)
-            if sighting is not None:
-                with self._lock:
-                    self._watch(q, "tracking", sighting["relation"]["support"])
-                return self._found(reply, q, "found_grounding", sighting,
-                                   f"I think I see {q.obj()} {_where(sighting)}.")
-
-        # 4. Not yet -- keep watching.
+        # 4. Not yet -- ask to be turned, and keep looking.
         with self._lock:
-            self._watch(q, "searching")
+            self._watch(q, "searching", view=view)
         if latest is None:
             msg = (f"My camera isn't sending me anything yet, but I'll look for {q.obj()} "
                    f"as soon as it does.")
+        elif not fresh:
+            msg = f"My camera view is a few seconds old. I'll look for {q.obj()} as soon as a new picture comes in."
         else:
-            msg = (f"I haven't seen {q.obj()} yet. Drive me around and I'll tell you "
-                   f"as soon as I spot {q.them()}.")
+            msg = f"I can't see {q.obj()} from here. {turn_me}"
         reply.update(outcome="not_found", reply=msg, searching=True)
         return reply
 
@@ -421,7 +522,8 @@ class Assistant:
                   f'the form {{"bbox_2d": [x1, y1, x2, y2]}}. If there is no {target} in the image, reply '
                   f"with only the word: none")
         try:
-            raw = generate_text(pil, prompt, max_new_tokens=48)
+            with self._gpu_lock:
+                raw = generate_text(pil, prompt, max_new_tokens=48)
         except Exception as e:  # never let a VLM hiccup turn into a 500 on the page
             print(f"[assistant] grounding failed: {e}")
             return None
@@ -445,8 +547,9 @@ class Assistant:
 
         crop = pil.crop((int(x1), int(y1), int(x2), int(y2)))
         try:
-            verdict = describe_images([crop], prompt=f"Is this a {target}? Answer yes or no.",
-                                      max_new_tokens=2, batch_size=1)[0]
+            with self._gpu_lock:
+                verdict = describe_images([crop], prompt=f"Is this a {target}? Answer yes or no.",
+                                          max_new_tokens=2, batch_size=1)[0]
         except Exception as e:
             print(f"[assistant] grounding verification failed: {e}")
             return None
@@ -471,6 +574,7 @@ class Assistant:
             latest = self._latest
             searches = [{
                 "target": s["query"].target, "state": s["state"], "age_s": round(now - s["started"], 1),
+                "looks": s["looks"], "checking": s["checking"],
             } for s in self._searches.values()]
             events = [e for e in self._events if e["id"] > since]
             last_id = self._next_id - 1
@@ -483,6 +587,12 @@ class Assistant:
                         x1, y1, x2, y2 = m["box"]
                         highlights.append({"target": s["query"].target, "label": m["display"],
                                            "box": [x1 / w, y1 / h, x2 / w, y2 / h]})
+                    elif s["highlight"] is not None and \
+                            _view_diff(latest["thumb"], s["highlight"]["thumb"]) < VIEW_CHANGED_THRES:
+                        # Found by Qwen3-VL (the detector can't box it): keep showing where,
+                        # for as long as the camera still looks at that same view.
+                        highlights.append({"target": s["query"].target, "label": s["highlight"]["label"],
+                                           "box": s["highlight"]["box"]})
         camera = None
         if latest is not None:
             camera = {"image": latest["preview"], "resolution": latest["resolution"], "frame": latest["frame_id"],

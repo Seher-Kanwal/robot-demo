@@ -21,11 +21,13 @@
     --bad: #ff5a5f;
     --info: #5b8cff;
     /* the only four button colors: green = start, amber = restart/switch, red = stop, blue = open/show.
-       The quick-start buttons and card stripes use them per module: 1 green, 2 amber, 3 blue. */
+       The quick-start buttons and card stripes use them per module: 1 green, 2 amber, 3 blue;
+       Part 3 is violet, the color memory-named boxes have on the module pages. */
     --green: #3ddc84;
     --amber: #ffb020;
     --red: #ff5c5c;
     --blue: #4da3ff;
+    --violet: #b98cff;
     --on-color: #0a0d11;
     --mono: "Martian Mono", ui-monospace, "SF Mono", Consolas, monospace;
     --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -68,6 +70,8 @@
     color: var(--text); margin: 2px 0 0; }
   .part-sub { font-size: 13px; color: var(--text-dim); margin: 4px 0 0; max-width: 70ch; }
   .scenes { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .part-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+  .part-status button { font-size: 12px; padding: 4px 12px; }
   .preset .num { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .1em; color: var(--text-faint); }
   /* fresh-demo memory controls (Part 1) */
   .memory { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-dim); min-width: 0; max-width: 520px; }
@@ -91,6 +95,7 @@
   .m1 { --c: var(--green); }
   .m2 { --c: var(--amber); }
   .m3 { --c: var(--blue); }
+  .m4 { --c: var(--violet); }
   .preset.stop { --c: var(--red); }
 
   /* service cards */
@@ -135,6 +140,7 @@
       <span class="gpu" title="GPU memory in use">GPU <span class="bar"><i id="gpuBar"></i></span> <span id="gpuText">–</span></span>
       <span class="pill" id="cameraPill">RealSense: –</span>
       <span class="pill" id="hubPill">connecting…</span>
+      <button type="button" data-preset="loadAll" title="Starts Module 1 and Module 2 once (about a minute) so every scene after that opens in a second or two">Load all models</button>
       <button type="button" class="danger" data-preset="stopAll" title="Stops all modules, frees the camera and GPU">Stop everything</button>
     </div>
   </header>
@@ -147,6 +153,10 @@
         <h2 class="part-title">Ask &amp; Remember</h2>
         <p class="part-sub">The energy-based OOD detector finds objects outside its training classes. The robot asks you what they are,
           stores a few views of each, and recognizes them later. No VLM.</p>
+        <div class="part-status">
+          <span class="pill" data-part-pill="module1">–</span>
+          <button type="button" class="danger ghost" data-stop-part="module1">Stop Module 1</button>
+        </div>
       </div>
       <div class="memory">
         <div>Robot memory: <span id="memSummary">–</span></div>
@@ -173,13 +183,37 @@
         <h2 class="part-title">Open-ended naming with a VLM</h2>
         <p class="part-sub">Our pipeline sends only the OOD objects to Qwen3-VL for a name. The baseline gives the whole image to Qwen3-VL alone.
           Compare them on speed, objects found and names.</p>
+        <div class="part-status">
+          <span class="pill" data-part-pill="module2">–</span>
+          <span class="pill" data-part-pill="module3">–</span>
+          <button type="button" class="danger ghost" data-stop-part="module2">Stop Modules 2 &amp; 3</button>
+        </div>
       </div>
     </div>
     <div class="scenes">
-      <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2"><span class="num">1 · OUR PIPELINE</span><b>OOD + VLM</b><span>Detector + energy OOD split; Qwen3-VL names only the unknown objects (asks you only if it can't).</span></button>
+      <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2"><span class="num">1 · OUR PIPELINE</span><b>OOD + VLM</b><span>Two screens side by side: OOD detection only, then Qwen3-VL naming the unknown objects (asks you only if it can't).</span></button>
       <button type="button" class="preset m3" data-preset="module3" data-window="module3"><span class="num">2 · BASELINE</span><b>VLM only</b><span>Qwen3-VL gets the whole camera image and finds and names every object by itself, no detector.</span></button>
       <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2" data-path="?compare=1"><span class="num">3 · SIDE BY SIDE</span><b>OOD + VLM vs VLM</b><span>Both on the same live frames, with a results table (ms/frame, fps, objects, names) and a CSV for the report.</span></button>
       <button type="button" class="preset m2" data-preset="vlmLive" data-window="module2" data-path="assistant"><span class="num">4 · APPLICATION</span><b>Robot assistant</b><span>"Robot, where are my headphones?" The robot answers from what it has seen, with distance.</span></button>
+    </div>
+  </section>
+
+  <!-- Part 3: Part 1's memory in front of Part 2's VLM (runs in the Module 2 server, page /hybrid) -->
+  <section class="part m4">
+    <div class="part-head">
+      <div>
+        <div class="part-kicker">Part 3 · OOD + Memory + OED</div>
+        <h2 class="part-title">Memory first, the VLM only for what's new</h2>
+        <p class="part-sub">OOD detection, then every OOD box is looked up in the objects taught in Part 1. Only the ones memory
+          can't name go to Qwen3-VL. Two screens (OOD only | OOD + memory + VLM) and each of the three steps on its own.</p>
+        <div class="part-status">
+          <span class="pill" data-part-pill="module2">–</span>
+          <span class="pill">Memory: <span id="memSummary3">–</span></span>
+        </div>
+      </div>
+    </div>
+    <div class="scenes">
+      <button type="button" class="preset m4" data-preset="vlmLive" data-window="module2" data-path="hybrid"><span class="num">1 · FULL PIPELINE</span><b>OOD + Memory + VLM</b><span>Taught objects are named from memory, with no VLM query; new ones are named by Qwen3-VL. Teach a few objects in Part 1 first.</span></button>
     </div>
   </section>
 
@@ -332,16 +366,18 @@
   function setMsg(name, text) { part(name, 'msg').textContent = text || ''; }
 
   // ---------------------------------------------------------------- start / stop
-  async function start(name, opts, quiet) {
+  // auto: a scene button -- take the camera from whoever has it without asking (the scene
+  // says what should run); the cards under Advanced still ask first.
+  async function start(name, opts, quiet, auto) {
     setMsg(name, '');
     let r = await api('/api/service/' + name + '/start', { options: opts });
     if (r.status === 409 && r.data.restart) {  // Module 3: Module 2 runs without the camera
-      if (!confirm(r.data.error)) return false;
+      if (!auto && !confirm(r.data.error)) return false;
       setMsg(name, 'restarting Module 2 with the RealSense…');
       r = await api('/api/service/' + name + '/start', { options: opts, restart: true });
     }
     if (r.status === 409 && r.data.conflict) {
-      if (!confirm(r.data.error)) return false;
+      if (!auto && !confirm(r.data.error)) return false;
       setMsg(name, 'stopping the camera user…');
       r = await api('/api/service/' + name + '/start', { options: opts, force: true, restart: true });
     }
@@ -363,8 +399,11 @@
     await stop(name);
     return start(name, options(name));
   }
+  // Options switched at runtime (camera, side-by-side view) don't make a running module "different".
+  const RUNTIME_OPTIONS = ['camera_off', 'dual_view'];
   function canon(o) {  // key order independent (the server sends keys sorted)
-    return JSON.stringify(Object.keys(o).sort().map(function (k) { return [k, String(o[k])]; }));
+    return JSON.stringify(Object.keys(o).filter(function (k) { return RUNTIME_OPTIONS.indexOf(k) < 0; })
+      .sort().map(function (k) { return [k, String(o[k])]; }));
   }
   function sameOptions(name, opts) {
     const cur = last && last.services[name];
@@ -376,7 +415,7 @@
     if (sameOptions(name, opts)) return true;
     const cur = last && last.services[name];
     if (cur && cur.state !== 'stopped' && cur.state !== 'crashed') await stop(name);
-    return start(name, opts);
+    return start(name, opts, false, true);
   }
 
   // Teach <-> Explore on a Module 1 that's already live on the camera: just flip its mode
@@ -388,33 +427,66 @@
     $('m1mode').value = mode;
     return true;
   }
-  function module1LiveOnCamera() {
-    const s = last && last.services.module1;
-    return s && s.state === 'running' && s.camera;
+  // A module that's already loaded only needs the camera handed to it (a second or two):
+  // the hub makes whoever has the RealSense let go of it, nobody reloads models. While the
+  // module is still starting, keep asking until it's up.
+  function loaded(name) {
+    const s = last && last.services[name];
+    return s && (s.state === 'running' || s.state === 'starting') && s.camera_capable;
   }
-  async function module1Live(mode) {
-    if (module1LiveOnCamera()) {
+  async function takeCamera(name) {
+    const until = Date.now() + 5 * 60 * 1000;  // Module 2's first start loads Qwen
+    for (;;) {
+      const r = await api('/api/service/' + name + '/camera', { on: true });
+      if (r.ok) { setMsg(name, ''); refresh(); return true; }
+      const s = last && last.services[name];
+      if (!(r.status === 409 && s && s.state === 'starting' && Date.now() < until)) {
+        setMsg(name, r.data.error || ('HTTP ' + r.status));
+        return false;
+      }
+      setMsg(name, 'loading the models…');
+      await new Promise(function (ok) { setTimeout(ok, 1500); });
+      await refresh();
+    }
+  }
+  async function setDual(on) {
+    const r = await api('/api/module1/dual', { on: on });
+    if (!r.ok) setMsg('module1', r.data.error || ('HTTP ' + r.status));
+    return r.ok;
+  }
+  async function module1Live(mode, dual) {
+    if (loaded('module1')) {
+      if (!(await takeCamera('module1'))) return false;
+      await setDual(dual);
       return switchModule1Mode(mode);
     }
-    return ensure('module1', Object.assign(options('module1'), { mode: mode }));
+    return ensure('module1', Object.assign(options('module1'), { mode: mode, dual_view: dual }));
   }
   $('m1modeNow').addEventListener('click', function () { switchModule1Mode($('m1mode').value); });
 
   const presets = {
-    teachLive: function () { return module1Live('teach'); },
-    explore: function () { return module1Live('explore'); },
+    teachLive: function () { return module1Live('teach', false); },
+    explore: function () { return module1Live('explore', false); },
     module3: async function () {
       const cur = last && last.services.module3;
-      return (cur && cur.state === 'running') || start('module3', options('module3'));
+      return (cur && cur.state === 'running') || start('module3', options('module3'), false, true);
     },
     // Part 1 scene 3: Module 1 with a second, explore-mode view of the same frames (/recognize)
-    teachReplay: function () {
-      return ensure('module1', Object.assign(options('module1'), { mode: 'teach', dual_view: true }));
-    },
+    teachReplay: function () { return module1Live('teach', true); },
     vlmLive: async function () {
       const m3 = last && last.services.module3;
       if (m3 && m3.state !== 'stopped' && m3.state !== 'crashed') await stop('module3');  // un-pause the pipeline
+      if (loaded('module2')) return takeCamera('module2');
       return ensure('module2', Object.assign(options('module2'), { realsense: true }));
+    },
+    // Load both modules once; afterwards every scene only hands the camera over. Module 1
+    // gets the camera if nobody has it, Module 2 starts without it.
+    loadAll: async function () {
+      const down = function (name) { const s = last.services[name]; return s.state === 'stopped' || s.state === 'crashed'; };
+      let ok = true;
+      if (down('module1')) ok = await start('module1', Object.assign(options('module1'), { camera_off: !!last.camera_owner }), true, true) && ok;
+      if (down('module2')) ok = await start('module2', Object.assign(options('module2'), { realsense: true, camera_off: true }), true, true) && ok;
+      return ok;
     },
     stopAll: async function () {
       for (const name of ['module3', 'module1', 'module2']) {
@@ -456,6 +528,18 @@
     });
   });
 
+  // Stop one part's module(s); Module 3 lives inside Module 2's server, so it goes first.
+  document.querySelectorAll('[data-stop-part]').forEach(function (b) {
+    b.addEventListener('click', async function () {
+      b.disabled = true;
+      const names = b.dataset.stopPart === 'module2' ? ['module3', 'module2'] : [b.dataset.stopPart];
+      for (const name of names) {
+        const cur = last && last.services[name];
+        if (cur && cur.state !== 'stopped') await stop(name);
+      }
+    });
+  });
+
   // ---------------------------------------------------------------- status rendering
   function ago(ts) {
     if (!ts) return '';
@@ -491,6 +575,16 @@
       cards[name].querySelector('[data-act=stop]').disabled = s.state === 'stopped';
       const open = part(name, 'open');
       if (open) open.setAttribute('aria-disabled', s.state === 'running' ? 'false' : 'true');
+    });
+    document.querySelectorAll('[data-part-pill]').forEach(function (el) {
+      const s = d.services[el.dataset.partPill];
+      el.dataset.state = s.state;
+      el.textContent = s.title.split(' · ')[0] + ' · ' + s.state +
+        (s.camera ? ' · camera' : s.state === 'running' && s.camera_capable ? ' · loaded, camera free' : '');
+    });
+    document.querySelectorAll('[data-stop-part]').forEach(function (b) {
+      const name = b.dataset.stopPart;
+      b.disabled = d.services[name].state === 'stopped' && (name !== 'module2' || d.services.module3.state === 'stopped');
     });
     document.querySelectorAll('[data-win-state]').forEach(function (el) {
       const s = d.services[el.dataset.winState];
@@ -637,6 +731,9 @@
     $('memSummary').textContent = memObjects.length
       ? memObjects.length + ' object' + (memObjects.length === 1 ? '' : 's') + ' (' + memObjects.join(', ') + ')'
       : 'empty';
+    $('memSummary3').textContent = memObjects.length
+      ? memObjects.length + ' taught object' + (memObjects.length === 1 ? '' : 's')
+      : 'empty -- teach objects in Part 1 first';
     const sel = $('memBackups'), keep = sel.value;
     sel.textContent = '';
     (r.data.backups.length ? r.data.backups : [null]).forEach(function (b) {
